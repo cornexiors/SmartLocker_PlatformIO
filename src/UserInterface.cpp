@@ -17,7 +17,6 @@ void UserInterface::notifyRemoteCommand(const String& title, const String& detai
     if (_state == HOME) {
         showResult(title, detail, isError);
     } else {
-        // Queue toast so we do not interrupt active user input
         _hasPendingNotice = true;
         _pendingTitle = title;
         _pendingDetail = detail;
@@ -27,6 +26,7 @@ void UserInterface::notifyRemoteCommand(const String& title, const String& detai
 
 void UserInterface::showResult(const String& title, const String& detail, bool isError) {
     _pin = "";
+    _activeOtp = "";
     _state = RESULT;
     _resultDeadline = millis() + Cfg::UI_RESULT_MS;
 
@@ -37,6 +37,9 @@ void UserInterface::showResult(const String& title, const String& detail, bool i
 
 void UserInterface::returnHome() {
     _pin = "";
+    _activeOtp = "";
+    _otpUserId = "";
+
     if (_hasPendingNotice) {
         _hasPendingNotice = false;
         showResult(_pendingTitle, _pendingDetail, _pendingError);
@@ -79,8 +82,11 @@ void UserInterface::refreshCurrentScreen() {
         case UNLOCK_CRED:
             _hw->drawCredentialPrompt(wifiOk, mqttOk, shortTime, false, _pin.length());
             break;
-        case ADMIN_PIN:
-            _hw->drawAdminPin(wifiOk, mqttOk, shortTime, _pin.length());
+        case OTP_ENTRY:
+            _hw->drawOtpPrompt(wifiOk, mqttOk, shortTime, _pin.length());
+            break;
+        case OTP_TAP_RFID:
+            _hw->drawOtpTapRfid(wifiOk, mqttOk, shortTime, _otpUserId.c_str());
             break;
         case ADMIN_MENU:
             {
@@ -100,7 +106,22 @@ void UserInterface::refreshCurrentScreen() {
 }
 
 void UserInterface::onRfidScanned(const String& uid) {
-    // Only accept fresh RFID taps when actively on a credential prompt screen
+    // Case 1: D-Mode OTP RFID registration tap
+    if (_state == OTP_TAP_RFID) {
+        touchActivity();
+        String registeredUser;
+        const ActionStatus st = _lockers->completeOtpRfidRegistration(_activeOtp, uid, registeredUser);
+        if (st == ActionStatus::OK) {
+            showResult("RFID REGISTERED", uid, false);
+        } else if (st == ActionStatus::ALREADY_ASSIGNED) {
+            showResult("RFID IN USE", "Already registered", true);
+        } else {
+            showResult("REG FAILED", "OTP expired/invalid", true);
+        }
+        return;
+    }
+
+    // Case 2: Assign or Unlock credential tap
     if (_state != ASSIGN_CRED && _state != UNLOCK_CRED) return;
 
     touchActivity();
@@ -128,6 +149,12 @@ void UserInterface::onRfidScanned(const String& uid) {
 }
 
 void UserInterface::onKey(char key) {
+    // 250ms cooldown prevents Column 3 (A/B/C/D) membrane bounce into 'C' (Back)
+    static uint32_t lastAcceptedKeyMs = 0;
+    const uint32_t now = millis();
+    if (now - lastAcceptedKeyMs < 250) return;
+    lastAcceptedKeyMs = now;
+
     touchActivity();
 
     if (_state == RESULT) {
@@ -158,7 +185,7 @@ void UserInterface::onKey(char key) {
             refreshCurrentScreen();
         } else if (key == 'D') {
             _pin = "";
-            _state = ADMIN_PIN;
+            _state = OTP_ENTRY;
             refreshCurrentScreen();
         }
         return;
@@ -217,8 +244,8 @@ void UserInterface::onKey(char key) {
         return;
     }
 
-    // HIDDEN ADMIN PIN ENTRY
-    if (_state == ADMIN_PIN) {
+    // D-MODE: OTP FOR RFID REGISTRATION (ALSO ACCEPTS ADMIN MASTER PIN)
+    if (_state == OTP_ENTRY) {
         if (key >= '0' && key <= '9' && _pin.length() < Cfg::PIN_MAX_LENGTH) {
             _pin += key;
             _hw->updateCredentialPin(_pin.length());
@@ -232,8 +259,17 @@ void UserInterface::onKey(char key) {
                 _pin = "";
                 _state = ADMIN_MENU;
                 refreshCurrentScreen();
+                return;
+            }
+            String userId;
+            if (_lockers->verifyOtp(_pin, userId)) {
+                _activeOtp = _pin;
+                _otpUserId = userId;
+                _pin = "";
+                _state = OTP_TAP_RFID;
+                refreshCurrentScreen();
             } else {
-                showResult("ADMIN DENIED", "Wrong Admin PIN", true);
+                showResult("INVALID / EXPIRED", "Check App OTP", true);
             }
         }
         return;
@@ -257,14 +293,12 @@ void UserInterface::onKey(char key) {
 void UserInterface::tick() {
     const uint32_t now = millis();
 
-    // Poll RFID reader continuously; only acts if on credential prompt screen
     String uid;
     if (_hw->readCard(uid)) {
-        Serial.printf("RFID Scanned: %s\n", uid.c_str());
+        appLog("INFO", "RFID Scanned: %s", uid.c_str());
         onRfidScanned(uid);
     }
 
-    // Debounced 4x4 keypad scan
     if (now - _lastKeyScan >= Cfg::KEYPAD_SCAN_MS) {
         _lastKeyScan = now;
         const char key = _hw->scanKey();
@@ -280,24 +314,32 @@ void UserInterface::tick() {
         }
     }
 
-    // 3-second result banner auto-dismiss
     if (_state == RESULT && static_cast<int32_t>(now - _resultDeadline) >= 0) {
         returnHome();
         return;
     }
 
-    // 18-second idle auto-timeout for all interactive sub-screens
     if (_state != HOME && _state != RESULT &&
         (now - _lastActivityMs >= Cfg::UI_IDLE_TIMEOUT_MS)) {
         returnHome();
         return;
     }
 
-    // 1-second top status bar clock & connectivity update
-    if (now - _lastUiRefresh >= Cfg::UI_REFRESH_MS) {
+    // Redraw Home body immediately if Wi-Fi or MQTT connection status changes
+    static bool lastShownWifi = false;
+    static bool lastShownMqtt = false;
+    const bool curWifi = _net->wifiConnected();
+    const bool curMqtt = _net->mqttConnected();
+
+    if (_state == HOME && (curWifi != lastShownWifi || curMqtt != lastShownMqtt)) {
+        lastShownWifi = curWifi;
+        lastShownMqtt = curMqtt;
+        refreshCurrentScreen();
+        _lastUiRefresh = now;
+    } else if (now - _lastUiRefresh >= Cfg::UI_REFRESH_MS) {
         _lastUiRefresh = now;
         char shortTime[12];
         _clock->formatShortLocal(shortTime, sizeof(shortTime));
-        _hw->updateHomeClock(_net->wifiConnected(), _net->mqttConnected(), shortTime);
+        _hw->updateHomeClock(curWifi, curMqtt, shortTime);
     }
 }

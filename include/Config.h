@@ -11,18 +11,45 @@ namespace Cfg {
 constexpr char WIFI_SSID[] = "RN10G5C";
 constexpr char WIFI_PASSWORD[] = "ngareplu";
 
-// Set MQTT_USE_TLS = true for port 8883 encrypted TLS,
-// or false for unencrypted port 1883 during local broker testing.
 constexpr bool MQTT_USE_TLS = true;
 constexpr char MQTT_HOST[] = "broker.hivemq.com";
 constexpr uint16_t MQTT_PORT = 8883;
 constexpr char MQTT_BASE[] = "smartlocker/demo/";
 constexpr char DEVICE_ID[] = "LOCKER_CONTROLLER_001";
 
-// Optional PEM Root CA certificate. Leave empty ("") to use TLS
-// encryption without strict CA pinning, or paste your broker's
-// root CA certificate here for full certificate verification.
-constexpr char MQTT_ROOT_CA[] = "";
+// Paste your broker's PEM Root CA here for strict certificate verification,
+// or leave empty ("") to use encrypted TLS without CA pinning.
+constexpr char MQTT_ROOT_CA[] = R"EOF(-----BEGIN CERTIFICATE-----
+MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
+TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
+cmNoIEdyb3VwMRUwEwYDVQQDEwxJU1JHIFJvb3QgWDEwHhcNMTUwNjA0MTEwNDM4
+WhcNMzUwNjA0MTEwNDM4WjBPMQswCQYDVQQGEwJVUzEpMCcGA1UEChMgSW50ZXJu
+ZXQgU2VjdXJpdHkgUmVzZWFyY2ggR3JvdXAxFTATBgNVBAMTDElTUkcgUm9vdCBY
+MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBAK3oJHP0FDfzm54rVygc
+h77ct984kIxuPOZXoHj3dcKi/vVqbvYATyjb3miGbESTtrFj/RQSa78f0uoxmyF+
+0TM8ukj13Xnfs7j/EvEhmkvBioZxaUpmZmyPfjxwv60pIgbz5MDmgK7iS4+3mX6U
+A5/TR5d8mUgjU+g4rk8Kb4Mu0UlXjIB0ttov0DiNewNwIRt18jA8+o+u3dpjq+sW
+T8KOEUt+zwvo/7V3LvSye0rgTBIlDHCNAymg4VMk7BPZ7hm/ELNKjD+Jo2FR3qyH
+B5T0Y3HsLuJvW5iB4YlcNHlsdu87kGJ55tukmi8mxdAQ4Q7e2RCOFvu396j3x+UC
+B5iPNgiV5+I3lg02dZ77DnKxHZu8A/lJBdiB3QW0KtZB6awBdpUKD9jf1b0SHzUv
+KBds0pjBqAlkd25HN7rOrFleaJ1/ctaJxQZBKT5ZPt0m9STJEadao0xAH0ahmbWn
+OlFuhjuefXKnEgV4We0+UXgVCwOPjdAvBbI+e0ocS3MFEvzG6uBQE3xDk3SzynTn
+jh8BCNAw1FtxNrQHusEwMFxIt4I7mKZ9YIqioymCzLq9gwQbooMDQaHWBfEbwrbw
+qHyGO0aoSCqI3Haadr8faqU9GY/rOPNk3sgrDQoo//fb4hVC1CLQJ13hef4Y53CI
+rU7m2Ys6xt0nUW7/vGT1M0NPAgMBAAGjQjBAMA4GA1UdDwEB/wQEAwIBBjAPBgNV
+HRMBAf8EBTADAQH/MB0GA1UdDgQWBBR5tFnme7bl5AFzgAiIyBpY9umbbjANBgkq
+hkiG9w0BAQsFAAOCAgEAVR9YqbyyqFDQDLHYGmkgJykIrGF1XIpu+ILlaS/V9lZL
+ubhzEFnTIZd+50xx+7LSYK05qAvqFyFWhfFQDlnrzuBZ6brJFe+GnY+EgPbk6ZGQ
+3BebYhtF8GaV0nxvwuo77x/Py9auJ/GpsMiu/X1+mvoiBOv/2X/qkSsisRcOj/KK
+NFtY2PwByVS5uCbMiogziUwthDyC3+6WVwW6LLv3xLfHTjuCvjHIInNzktHCgKQ5
+ORAzI4JMPJ+GslWYHb4phowim57iaztXOoJwTdwJx4nLCgdNbOhdjsnvzqvHu7Ur
+TkXWStAmzOVyyghqpZXjFaH3pO3JLF+l+/+sKAIuvtd7u+Nxe5AW0wdeRlN8NwdC
+jNPElpzVmbUq4JUagEiuTDkHzsxHpFKVK7q4+63SM1N95R1NbdWhscdCb+ZAJzVc
+oyi3B43njTOQ5yOf+1CceWxG1bQVs5ZufpsMljq4Ui0/1lvh+wjChP4kqKOJ2qxq
+4RgqsahDYVvTH9w7jXbyLeiNdd8XM2w9U/t7y0Ff/9yi0GE44Za4rF2LN9d11TPA
+mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
+emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
+-----END CERTIFICATE-----)EOF";
 
 constexpr char HMAC_SECRET[] = "smart-locker-demo-secret-key-32";
 
@@ -46,7 +73,6 @@ constexpr uint8_t SERVO_PINS[LOCKER_COUNT] = {
 constexpr int SERVO_LOCK_ANGLE = 180;
 constexpr int SERVO_UNLOCK_ANGLE = 0;
 
-// Standard 180-degree positional SG90 / MG90S pulse bounds
 constexpr uint16_t SERVO_MIN_US = 1000;
 constexpr uint16_t SERVO_MAX_US = 2000;
 
@@ -62,7 +88,6 @@ constexpr uint8_t LOCKER_ACTUATOR[LOCKER_COUNT] = {
 
 // ============================================================
 // PCF8575 I/O EXPANDER
-// P0-P3 = keypad rows | P4-P7 = keypad columns | P8-P15 = reserved
 // ============================================================
 
 constexpr uint8_t PCF8575_ADDRESS_FIRST = 0x20;
@@ -84,42 +109,35 @@ constexpr bool EXPANDER_UNLOCK_HIGH[LOCKER_COUNT] = {
 };
 
 // ============================================================
-// I2C (PCF8575 + Optional 3.3V RTC)
+// I2C & SPI PINS
 // ============================================================
 
 constexpr uint8_t I2C_SDA = 1;
 constexpr uint8_t I2C_SCL = 2;
 constexpr uint8_t RTC_ADDRESS = 0x68;
 
-// ============================================================
-// SPI (Shared by MFRC522, ST7735 TFT, and microSD)
-// ============================================================
-
 constexpr uint8_t SPI_SCK = 12;
 constexpr uint8_t SPI_MISO = 13;
 constexpr uint8_t SPI_MOSI = 11;
 
-// MFRC522
 constexpr uint8_t RFID_CS = 7;
 constexpr uint8_t RFID_RST = 6;
 
-// TFT ST7735 (128x140)
 constexpr uint8_t TFT_CS = 10;
 constexpr uint8_t TFT_DC = 9;
 constexpr uint8_t TFT_RST = 8;
 
-constexpr uint8_t TFT_ROTATION = 0;
-// 0 = BLACKTAB, 1 = GREENTAB, 2 = REDTAB
+// 2 = Portrait rotated 180 degrees (fixes upside-down mounting)
+constexpr uint8_t TFT_ROTATION = 2;
 constexpr uint8_t TFT_INIT_TAB = 0;
 constexpr uint16_t TFT_WIDTH = 128;
 constexpr uint16_t TFT_VISIBLE_HEIGHT = 140;
 
-// microSD
 constexpr uint8_t SD_CS = 5;
 constexpr uint32_t SD_SPI_HZ = 4000000;
 
 // ============================================================
-// REED SWITCHES & DOOR ALERTS
+// REED SWITCHES & INDICATORS
 // ============================================================
 
 constexpr uint8_t REED_PINS[LOCKER_COUNT] = {
@@ -131,12 +149,8 @@ constexpr uint8_t REED_PINS[LOCKER_COUNT] = {
 
 constexpr uint8_t REED_CLOSED_LEVEL = LOW;
 constexpr uint16_t REED_DEBOUNCE_MS = 45;
-constexpr uint32_t DOOR_OPEN_ALERT_MS = 60000;     // Alert if door open > 60s
-constexpr uint32_t DOOR_ALERT_REPEAT_MS = 10000;   // Chirp every 10s while open
-
-// ============================================================
-// STATUS INDICATORS
-// ============================================================
+constexpr uint32_t DOOR_OPEN_ALERT_MS = 60000;
+constexpr uint32_t DOOR_ALERT_REPEAT_MS = 10000;
 
 constexpr uint8_t LED_PIN = 17;
 constexpr uint8_t BUZZER_PIN = 38;
@@ -144,7 +158,7 @@ constexpr bool BUZZER_ENABLED = true;
 constexpr uint16_t BUZZER_TONE_HZ = 2000;
 
 // ============================================================
-// KEYPAD
+// KEYPAD & TIMING
 // ============================================================
 
 constexpr char KEYMAP[4][4] = {
@@ -154,49 +168,41 @@ constexpr char KEYMAP[4][4] = {
     {'*', '0', '#', 'D'}
 };
 
-// ============================================================
-// TIMING
-// ============================================================
-
 constexpr uint32_t WIFI_RETRY_MS = 10000;
 constexpr uint32_t MQTT_RETRY_MS = 5000;
 
 constexpr uint32_t KEYPAD_SCAN_MS = 25;
 constexpr uint32_t RFID_SCAN_MS = 100;
 constexpr uint32_t UI_REFRESH_MS = 1000;
-constexpr uint32_t UI_RESULT_MS = 3000;          // 3-second action confirmation
-constexpr uint32_t UI_IDLE_TIMEOUT_MS = 18000;   // 18-second auto return to Home
+constexpr uint32_t UI_RESULT_MS = 3000;
+constexpr uint32_t UI_IDLE_TIMEOUT_MS = 18000;
 
 // ============================================================
-// RENTAL, PIN, USER SYNC, AND ADMIN
+// RENTAL, USERS, OTP & STORAGE
 // ============================================================
 
-constexpr uint32_t RENTAL_SECONDS = 24UL * 60UL * 60UL; // 24 hours
+constexpr uint32_t RENTAL_SECONDS = 24UL * 60UL * 60UL;
 constexpr uint8_t PIN_MIN_LENGTH = 4;
 constexpr uint8_t PIN_MAX_LENGTH = 8;
 constexpr uint16_t PIN_PBKDF2_ITERATIONS = 10000;
 
 constexpr uint8_t MAX_USERS = 32;
+constexpr uint8_t MAX_PENDING_OTPS = 16;
+constexpr uint32_t OTP_TTL_MS = 5UL * 60UL * 1000UL; // 5 minutes
+
 constexpr char ADMIN_MASTER_PIN[] = "999999";
 constexpr char APP_REGISTER_URL[] = "app.smartlocker.id";
 
-// ============================================================
-// STORAGE
-// ============================================================
-
 constexpr uint8_t SYNC_QUEUE_CAPACITY = 12;
+constexpr uint8_t DEBUG_LOG_CAPACITY = 20;
 
 // ============================================================
-// TIME & NTP
+// TIME & REMOTE COMMAND SECURITY
 // ============================================================
 
 constexpr uint32_t MIN_VALID_EPOCH = 1700000000UL;
-constexpr int8_t LOCAL_UTC_OFFSET_HOURS = 7;          // WIB (UTC+7)
-constexpr uint32_t NTP_RESYNC_MS = 2UL * 60UL * 60UL * 1000UL; // Every 2 hours
-
-// ============================================================
-// REMOTE COMMAND SECURITY
-// ============================================================
+constexpr int8_t LOCAL_UTC_OFFSET_HOURS = 7;
+constexpr uint32_t NTP_RESYNC_MS = 2UL * 60UL * 60UL * 1000UL;
 
 constexpr uint32_t COMMAND_WINDOW_SECONDS = 300;
 constexpr bool ENABLE_COMMAND_TIMESTAMP_CHECK = false;

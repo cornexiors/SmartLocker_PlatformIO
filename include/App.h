@@ -41,7 +41,7 @@ inline bool isExpiredHold(const LockerRecord& r) {
 }
 
 struct UserRecord {
-    uint8_t active = 0;        // 1 = valid registered user
+    uint8_t active = 0;
     char userId[25] = {};
     char uid[21] = {};
     char salt[17] = {};
@@ -75,14 +75,22 @@ public:
     bool enqueue(const String& payload);
     bool peek(String& payload);
     void pop();
+    uint8_t queueCount() const;
+
+    void saveWifiOverride(const String& ssid, const String& password);
+    bool loadWifiOverride(String& ssid, String& password);
+    void clearWifiOverride();
 
     bool sdReady() const { return _sdReady; }
     void logEvent(const String& payload);
+    void dumpSdLog(Stream& out);
+    void clearSdLog();
 
 private:
     Preferences _prefs;
     Preferences _users;
     Preferences _queue;
+    Preferences _netCfg;
 
     bool _sdReady = false;
     uint8_t _head = 0;
@@ -90,7 +98,7 @@ private:
 };
 
 // ============================================================
-// CLOCK SERVICE (Internal ESP32 RTC + NTP + Optional External RTC)
+// CLOCK SERVICE
 // ============================================================
 
 class ClockService {
@@ -151,10 +159,12 @@ public:
                               bool assigning, uint8_t pinLength);
     void updateCredentialPin(uint8_t pinLength);
 
+    void drawOtpPrompt(bool wifiOk, bool mqttOk, const char* shortTime, uint8_t pinLength);
+    void drawOtpTapRfid(bool wifiOk, bool mqttOk, const char* shortTime, const char* userId);
+
     void drawResult(bool wifiOk, bool mqttOk, const char* shortTime,
                     const String& title, const String& detail, bool isError);
 
-    void drawAdminPin(bool wifiOk, bool mqttOk, const char* shortTime, uint8_t pinLength);
     void drawAdminMenu(bool wifiOk, bool mqttOk, const char* shortTime,
                        const LockerRecord records[Cfg::LOCKER_COUNT],
                        const bool locked[Cfg::LOCKER_COUNT],
@@ -203,7 +213,11 @@ private:
 
 class NetworkService {
 public:
-    void begin();
+    void begin(const char* ssid = Cfg::WIFI_SSID,
+               const char* password = Cfg::WIFI_PASSWORD);
+    void setWifiCredentials(const String& ssid, const String& password);
+    String currentSsid() const { return _ssid; }
+
     void tick();
 
     bool wifiConnected() const;
@@ -214,6 +228,8 @@ public:
     bool publishLockerState(uint8_t index, bool locked, bool assigned,
                             bool expired, const char* userId, const char* method);
     bool publishAck(uint8_t index, const String& payload);
+    bool publishRfidRegAck(const String& userId, const String& uid,
+                           bool success, const char* reason);
     bool publishUserSyncRequest(uint8_t userCount);
 
     void setCommandHandler(void (*handler)(const String&));
@@ -226,6 +242,9 @@ private:
     WiFiClient _plainClient;
     WiFiClientSecure _tlsClient;
     PubSubClient _mqtt;
+
+    String _ssid;
+    String _password;
 
     uint32_t _lastWifiAttempt = 0;
     uint32_t _lastMqttAttempt = 0;
@@ -246,17 +265,22 @@ public:
                ClockService& clock, NetworkService& network);
     void tick();
 
-    // User-facing operations (requires registered user in synced DB)
+    // User-facing assign & single-use unlock/release
     ActionStatus assignByUid(const String& uid, String& lockerName);
     ActionStatus assignByPin(const String& pin, String& lockerName);
-
-    // Unlocks locker AND auto-releases assignment back to AVAILABLE
     ActionStatus unlockAndReleaseByUid(const String& uid, String& lockerName);
     ActionStatus unlockAndReleaseByPin(const String& pin, String& lockerName);
 
-    // Remote / Admin operations
+    // D-mode self-service RFID registration via App OTP
+    bool registerPendingOtp(const String& userId, const String& otp);
+    bool verifyOtp(const String& otp, String& outUserId);
+    ActionStatus completeOtpRfidRegistration(const String& otp, const String& uid,
+                                             String& outUserId);
+
+    // Remote / Admin / Serial operations
     bool remoteSetLock(uint8_t index, bool locked, const char* source = "BACKEND");
     bool release(uint8_t index, const char* source = "BACKEND");
+    void broadcastAllStates(const char* method = "SYNC");
 
     // Two-way user database sync
     bool upsertUser(const String& userId, const String& uid,
@@ -264,6 +288,7 @@ public:
     bool deleteUser(const String& userId);
     void clearUsers();
     uint8_t registeredUserCount() const;
+    void listUsersToSerial(Stream& out) const;
 
     // Queries
     int findLockerId(const String& id) const;
@@ -279,6 +304,13 @@ public:
     }
 
 private:
+    struct PendingOtp {
+        bool active = false;
+        char userId[25] = {};
+        char otp[12] = {};
+        uint32_t expiresAtMs = 0;
+    };
+
     int findRegisteredUserByUid(const String& uid) const;
     int findRegisteredUserByPin(const String& pin) const;
     int findAssignedLockerByUserId(const String& userId) const;
@@ -301,6 +333,7 @@ private:
 
     LockerRecord _records[Cfg::LOCKER_COUNT];
     UserRecord _users[Cfg::MAX_USERS];
+    PendingOtp _otps[Cfg::MAX_PENDING_OTPS];
 
     bool _locked[Cfg::LOCKER_COUNT] = {true, true, true, true};
     uint32_t _doorOpenedAt[Cfg::LOCKER_COUNT] = {0, 0, 0, 0};
@@ -311,7 +344,7 @@ private:
 };
 
 // ============================================================
-// USER INTERFACE (Non-Blocking Graphic FSM)
+// USER INTERFACE
 // ============================================================
 
 class UserInterface {
@@ -320,7 +353,6 @@ public:
                ClockService& clock, NetworkService& net);
     void tick();
 
-    // Non-intrusive 3s confirmation banner for remote MQTT commands
     void notifyRemoteCommand(const String& title, const String& detail, bool isError);
 
 private:
@@ -330,8 +362,9 @@ private:
         QR_CODE,
         ASSIGN_CRED,
         UNLOCK_CRED,
+        OTP_ENTRY,
+        OTP_TAP_RFID,
         RESULT,
-        ADMIN_PIN,
         ADMIN_MENU
     };
 
@@ -349,8 +382,9 @@ private:
 
     State _state = HOME;
     String _pin;
+    String _activeOtp;
+    String _otpUserId;
 
-    // Queued remote notification (shown on Home without interrupting user input)
     bool _hasPendingNotice = false;
     String _pendingTitle;
     String _pendingDetail;
@@ -367,7 +401,7 @@ private:
 };
 
 // ============================================================
-// GLOBALS & CRYPTO HELPERS
+// GLOBALS & HELPERS
 // ============================================================
 
 extern Storage gStorage;
@@ -380,3 +414,4 @@ extern UserInterface gUi;
 String makePinHash(const char* salt, const String& pin);
 bool verifySignedPacket(const String& packet, uint8_t expectedFields,
                         String* outFields, String& errorReason);
+void appLog(const char* level, const char* fmt, ...);

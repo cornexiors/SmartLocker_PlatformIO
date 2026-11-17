@@ -2,8 +2,10 @@
 
 NetworkService* NetworkService::_self = nullptr;
 
-void NetworkService::begin() {
+void NetworkService::begin(const char* ssid, const char* password) {
     _self = this;
+    _ssid = ssid ? ssid : Cfg::WIFI_SSID;
+    _password = password ? password : Cfg::WIFI_PASSWORD;
 
     if (Cfg::MQTT_USE_TLS) {
         if (Cfg::MQTT_ROOT_CA[0] != '\0') {
@@ -23,7 +25,19 @@ void NetworkService::begin() {
     _mqtt.setKeepAlive(20);
 
     WiFi.mode(WIFI_STA);
-    WiFi.begin(Cfg::WIFI_SSID, Cfg::WIFI_PASSWORD);
+    WiFi.begin(_ssid.c_str(), _password.c_str());
+    _lastWifiAttempt = millis();
+}
+
+void NetworkService::setWifiCredentials(const String& ssid, const String& password) {
+    _ssid = ssid;
+    _password = password;
+    if (_mqtt.connected()) {
+        _mqtt.disconnect();
+    }
+    WiFi.disconnect(true);
+    delay(100);
+    WiFi.begin(_ssid.c_str(), _password.c_str());
     _lastWifiAttempt = millis();
 }
 
@@ -44,7 +58,7 @@ void NetworkService::tick() {
     if (!wifiConnected()) {
         if (now - _lastWifiAttempt >= Cfg::WIFI_RETRY_MS) {
             _lastWifiAttempt = now;
-            WiFi.reconnect();
+            WiFi.begin(_ssid.c_str(), _password.c_str());
         }
         return;
     }
@@ -68,26 +82,23 @@ void NetworkService::connectMqtt() {
     snprintf(willTopic, sizeof(willTopic), "%sdevice/status", Cfg::MQTT_BASE);
 
     if (!_mqtt.connect(clientId, willTopic, 1, true, "OFFLINE")) {
-        Serial.printf("MQTT connect failed: %d\n", _mqtt.state());
+        appLog("WARN", "MQTT connect failed: %d", _mqtt.state());
         return;
     }
 
-    Serial.println(F("MQTT connected"));
+    appLog("INFO", "MQTT connected");
     _mqtt.publish(willTopic, "ONLINE", true);
 
-    // Subscribe to per-locker commands
     for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
         char topic[64];
         snprintf(topic, sizeof(topic), "%s%s/command", Cfg::MQTT_BASE, Cfg::LOCKER_IDS[i]);
         _mqtt.subscribe(topic, 1);
     }
 
-    // Subscribe to two-way user database sync topic
     char syncTopic[64];
     snprintf(syncTopic, sizeof(syncTopic), "%susers/sync", Cfg::MQTT_BASE);
     _mqtt.subscribe(syncTopic, 1);
 
-    // Request latest user database delta/snapshot from backend on connect
     publishUserSyncRequest(_cachedUserCount);
 }
 
@@ -156,6 +167,23 @@ bool NetworkService::publishAck(uint8_t index, const String& payload) {
     char topic[64];
     snprintf(topic, sizeof(topic), "%s%s/ack", Cfg::MQTT_BASE, Cfg::LOCKER_IDS[index]);
     return _mqtt.publish(topic, payload.c_str(), false);
+}
+
+bool NetworkService::publishRfidRegAck(const String& userId, const String& uid,
+                                       bool success, const char* reason) {
+    if (!mqttConnected()) return false;
+    char topic[64];
+    snprintf(topic, sizeof(topic), "%susers/ack", Cfg::MQTT_BASE);
+
+    char payload[128];
+    snprintf(payload, sizeof(payload),
+             "RFID_REG_ACK|%s|%s|%s|%s",
+             userId.c_str(),
+             uid.c_str(),
+             success ? "ACCEPTED" : "REJECTED",
+             reason ? reason : "");
+
+    return _mqtt.publish(topic, payload, false);
 }
 
 bool NetworkService::publishUserSyncRequest(uint8_t userCount) {

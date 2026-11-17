@@ -2,7 +2,6 @@
 
 namespace {
 
-// 64x64 1-bit QR code bitmap for app registration URL (PROGMEM)
 constexpr uint8_t QR_SIZE = 64;
 const uint8_t QR_BITMAP[64 * 8] PROGMEM = {
     0xFF,0xFF,0x00,0xAA,0x55,0x00,0xFF,0xFF,
@@ -71,18 +70,15 @@ const uint8_t QR_BITMAP[64 * 8] PROGMEM = {
     0xFF,0xFF,0x55,0xAA,0x00,0xFF,0x55,0xAA
 };
 
-constexpr uint16_t COLOR_TOPBAR = 0x18E3;   // Dark slate blue
-constexpr uint16_t COLOR_CARD   = 0x10A2;   // Deep card background
-constexpr uint16_t COLOR_ACCENT = 0x05FF;   // Bright cyan-blue
-constexpr uint16_t COLOR_WARN   = 0xFD20;   // Amber orange
-constexpr uint16_t COLOR_ERR    = 0xF800;   // Red
-constexpr uint16_t COLOR_OK     = 0x07E0;   // Green
+constexpr uint16_t COLOR_TOPBAR = 0x18E3;
+constexpr uint16_t COLOR_CARD   = 0x10A2;
+constexpr uint16_t COLOR_ACCENT = 0x05FF;
+constexpr uint16_t COLOR_WARN   = 0xFD20;
+constexpr uint16_t COLOR_ERR    = 0xF800;
+constexpr uint16_t COLOR_OK     = 0x07E0;
+constexpr uint8_t  BUZZER_LEDC_CH = 7;
 
 } // namespace
-
-// ============================================================
-// PCF8575 LOW-LEVEL ACCESS
-// ============================================================
 
 bool Hardware::pcfWrite(uint16_t value) {
     if (!_i2cReady) return false;
@@ -101,10 +97,6 @@ bool Hardware::pcfRead(uint16_t& value) {
     value = static_cast<uint16_t>(lo) | (static_cast<uint16_t>(hi) << 8);
     return true;
 }
-
-// ============================================================
-// INITIALIZATION
-// ============================================================
 
 bool Hardware::begin() {
     Wire.begin(Cfg::I2C_SDA, Cfg::I2C_SCL);
@@ -128,9 +120,11 @@ bool Hardware::begin() {
     pinMode(Cfg::LED_PIN, OUTPUT);
     digitalWrite(Cfg::LED_PIN, LOW);
 
+    // Reserve dedicated LEDC channel 7 for passive buzzer so it never collides with servos
     if (Cfg::BUZZER_ENABLED) {
-        pinMode(Cfg::BUZZER_PIN, OUTPUT);
-        digitalWrite(Cfg::BUZZER_PIN, LOW);
+        ledcSetup(BUZZER_LEDC_CH, Cfg::BUZZER_TONE_HZ, 8);
+        ledcAttachPin(Cfg::BUZZER_PIN, BUZZER_LEDC_CH);
+        ledcWriteTone(BUZZER_LEDC_CH, 0);
     }
 
     pinMode(Cfg::RFID_CS, OUTPUT);
@@ -155,6 +149,9 @@ bool Hardware::begin() {
     _rfid.PCD_Init();
     _rfidReady = true;
 
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+
     for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
         if (Cfg::REED_PINS[i] != Cfg::PCF_UNUSED_PIN) {
             pinMode(Cfg::REED_PINS[i], INPUT_PULLUP);
@@ -172,16 +169,12 @@ bool Hardware::begin() {
         }
     }
 
-    Serial.printf("PCF8575: %s (0x%02X) | MFRC522: %s | ST7735: %s\n",
-                  _pcfReady ? "ready" : "missing", _pcfAddress,
-                  _rfidReady ? "ready" : "failed",
-                  _displayReady ? "ready" : "failed");
+    appLog("INFO", "PCF8575:%s(0x%02X) MFRC522:%s ST7735:%s",
+           _pcfReady ? "ok" : "missing", _pcfAddress,
+           _rfidReady ? "ok" : "fail",
+           _displayReady ? "ok" : "fail");
     return true;
 }
-
-// ============================================================
-// INPUTS & ACTUATORS
-// ============================================================
 
 char Hardware::scanKey() {
     if (!_pcfReady) return 0;
@@ -284,7 +277,9 @@ void Hardware::setLed(bool on) {
 
 void Hardware::beep(uint16_t durationMs) {
     if (!Cfg::BUZZER_ENABLED || durationMs == 0) return;
-    tone(Cfg::BUZZER_PIN, Cfg::BUZZER_TONE_HZ, durationMs);
+    ledcWriteTone(BUZZER_LEDC_CH, Cfg::BUZZER_TONE_HZ);
+    delay(durationMs);
+    ledcWriteTone(BUZZER_LEDC_CH, 0);
 }
 
 // ============================================================
@@ -296,17 +291,14 @@ void Hardware::drawConnectivityIcon(int16_t x, int16_t y, bool wifiOk, bool mqtt
     if (!wifiOk) color = COLOR_ERR;
     else if (!mqttOk) color = COLOR_WARN;
 
-    // 3 ascending signal bars
-    _tft.fillRect(x,     y + 6, 3, 4, color);
-    _tft.fillRect(x + 5, y + 3, 3, 7, color);
-    _tft.fillRect(x + 10, y,    3, 10, color);
+    _tft.fillRect(x,      y + 6, 3, 4, color);
+    _tft.fillRect(x + 5,  y + 3, 3, 7, color);
+    _tft.fillRect(x + 10, y,     3, 10, color);
 
     if (!wifiOk) {
-        // Red diagonal slash for Offline
         _tft.drawLine(x - 1, y + 10, x + 13, y - 1, COLOR_ERR);
         _tft.drawLine(x,     y + 10, x + 14, y - 1, COLOR_ERR);
     } else if (!mqttOk) {
-        // Amber exclamation mark for Server Disconnected
         _tft.fillRect(x + 15, y,     2, 6, COLOR_WARN);
         _tft.fillRect(x + 15, y + 8, 2, 2, COLOR_WARN);
     }
@@ -333,7 +325,6 @@ void Hardware::drawHome(bool wifiOk, bool mqttOk, const char* shortTime,
 
     int16_t cursorY = 21;
 
-    // Connection warning banner ONLY when disconnected
     if (!wifiOk) {
         _tft.fillRoundRect(4, cursorY, 120, 14, 3, COLOR_ERR);
         _tft.setTextColor(ST77XX_WHITE);
@@ -350,7 +341,6 @@ void Hardware::drawHome(bool wifiOk, bool mqttOk, const char* shortTime,
         cursorY += 17;
     }
 
-    // Available Lockers graphic card
     const int16_t cardH = (problematic > 0) ? 44 : 56;
     _tft.fillRoundRect(6, cursorY, 116, cardH, 6, COLOR_CARD);
     _tft.drawRoundRect(6, cursorY, 116, cardH, 6, COLOR_ACCENT);
@@ -370,7 +360,6 @@ void Hardware::drawHome(bool wifiOk, bool mqttOk, const char* shortTime,
 
     cursorY += cardH + 5;
 
-    // Problematic (>24h) lockers badge — ONLY shown when > 0
     if (problematic > 0) {
         _tft.fillRoundRect(6, cursorY, 116, 16, 4, COLOR_ERR);
         _tft.setTextSize(1);
@@ -381,7 +370,6 @@ void Hardware::drawHome(bool wifiOk, bool mqttOk, const char* shortTime,
         cursorY += 20;
     }
 
-    // Bottom graphic action buttons
     const int16_t btnY = 114;
     _tft.fillRoundRect(4, btnY, 58, 22, 4, COLOR_ACCENT);
     _tft.setTextSize(1);
@@ -439,7 +427,6 @@ void Hardware::drawQrCode(bool wifiOk, bool mqttOk, const char* shortTime, const
     _tft.setCursor(16, 21);
     _tft.print(F("SCAN TO REGISTER"));
 
-    // White quiet-zone frame + 64x64 PROGMEM QR bitmap
     _tft.fillRect(28, 32, 72, 72, ST77XX_WHITE);
     _tft.drawBitmap(32, 36, QR_BITMAP, QR_SIZE, QR_SIZE, ST77XX_BLACK);
 
@@ -501,6 +488,54 @@ void Hardware::updateCredentialPin(uint8_t pinLength) {
     drawPinUnderlineBoxes(pinLength);
 }
 
+void Hardware::drawOtpPrompt(bool wifiOk, bool mqttOk, const char* shortTime, uint8_t pinLength) {
+    if (!_displayReady) return;
+    _tft.fillScreen(ST77XX_BLACK);
+    drawTopBar(wifiOk, mqttOk, shortTime);
+
+    _tft.setTextSize(1);
+    _tft.setTextColor(COLOR_ACCENT);
+    _tft.setCursor(16, 23);
+    _tft.print(F("LINK RFID CARD"));
+
+    _tft.setTextColor(ST77XX_WHITE);
+    _tft.setCursor(12, 40);
+    _tft.print(F("Enter App OTP Code"));
+
+    drawPinUnderlineBoxes(pinLength);
+
+    _tft.setTextColor(ST77XX_YELLOW);
+    _tft.setCursor(6, 102);
+    _tft.print(F("*:Del   #:OK   C:Back"));
+}
+
+void Hardware::drawOtpTapRfid(bool wifiOk, bool mqttOk, const char* shortTime, const char* userId) {
+    if (!_displayReady) return;
+    _tft.fillScreen(ST77XX_BLACK);
+    drawTopBar(wifiOk, mqttOk, shortTime);
+
+    _tft.fillRoundRect(6, 28, 116, 82, 6, COLOR_CARD);
+    _tft.drawRoundRect(6, 28, 116, 82, 6, COLOR_OK);
+
+    _tft.setTextSize(1);
+    _tft.setTextColor(COLOR_OK);
+    _tft.setCursor(14, 40);
+    _tft.print(F("OTP VERIFIED!"));
+
+    _tft.setTextColor(ST77XX_WHITE);
+    _tft.setCursor(14, 58);
+    _tft.print(F("Tap RFID card now"));
+
+    _tft.setTextColor(COLOR_ACCENT);
+    _tft.setCursor(14, 80);
+    _tft.print(F("User: "));
+    _tft.print(userId);
+
+    _tft.setTextColor(ST77XX_YELLOW);
+    _tft.setCursor(8, 120);
+    _tft.print(F("C: Cancel"));
+}
+
 void Hardware::drawResult(bool wifiOk, bool mqttOk, const char* shortTime,
                           const String& title, const String& detail, bool isError) {
     if (!_displayReady) return;
@@ -519,27 +554,6 @@ void Hardware::drawResult(bool wifiOk, bool mqttOk, const char* shortTime,
     _tft.setTextColor(ST77XX_WHITE);
     _tft.setCursor(12, 72);
     _tft.print(detail);
-}
-
-void Hardware::drawAdminPin(bool wifiOk, bool mqttOk, const char* shortTime, uint8_t pinLength) {
-    if (!_displayReady) return;
-    _tft.fillScreen(ST77XX_BLACK);
-    drawTopBar(wifiOk, mqttOk, shortTime);
-
-    _tft.setTextSize(1);
-    _tft.setTextColor(COLOR_WARN);
-    _tft.setCursor(28, 24);
-    _tft.print(F("ADMIN MODE"));
-
-    _tft.setTextColor(ST77XX_WHITE);
-    _tft.setCursor(18, 42);
-    _tft.print(F("Enter Admin PIN"));
-
-    drawPinUnderlineBoxes(pinLength);
-
-    _tft.setTextColor(ST77XX_YELLOW);
-    _tft.setCursor(6, 102);
-    _tft.print(F("*:Del   #:OK   C:Back"));
 }
 
 void Hardware::drawAdminMenu(bool wifiOk, bool mqttOk, const char* shortTime,

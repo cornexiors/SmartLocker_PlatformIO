@@ -56,7 +56,7 @@ void LockerManager::begin(Storage& storage, Hardware& hardware,
     for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
         _locked[i] = true;
         if (!_hardware->setLockerActuator(i, true)) {
-            Serial.printf("WARN: actuator init failed for %s\n", Cfg::LOCKER_IDS[i]);
+            appLog("WARN", "Actuator init failed for %s", Cfg::LOCKER_IDS[i]);
         }
         if (!_hardware->doorClosed(i)) {
             _doorOpenedAt[i] = millis();
@@ -81,6 +81,12 @@ void LockerManager::publishFullLockerState(uint8_t index, const char* method) {
     );
 }
 
+void LockerManager::broadcastAllStates(const char* method) {
+    for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
+        publishFullLockerState(i, method);
+    }
+}
+
 void LockerManager::emitEvent(const char* name, uint8_t index, const char* method, const char* userId) {
     char json[320];
     const uint64_t now = _clock ? _clock->nowUtc() : 0;
@@ -99,17 +105,17 @@ void LockerManager::emitEvent(const char* name, uint8_t index, const char* metho
              method, static_cast<unsigned long long>(now));
 
     const String payload(json);
-    Serial.println(payload);
+    appLog("EVENT", "%s", json);
     _storage->logEvent(payload);
     if (!_storage->enqueue(payload)) {
-        Serial.println(F("WARN: local sync queue full"));
+        appLog("WARN", "Local NVS sync queue full");
     }
 }
 
 bool LockerManager::setLock(uint8_t index, bool locked, const char* method) {
     if (index >= Cfg::LOCKER_COUNT) return false;
     if (!_hardware->setLockerActuator(index, locked)) {
-        Serial.printf("ERROR: actuator command failed for %s\n", Cfg::LOCKER_IDS[index]);
+        appLog("ERR", "Actuator command failed for %s", Cfg::LOCKER_IDS[index]);
         return false;
     }
     _locked[index] = locked;
@@ -150,6 +156,19 @@ uint8_t LockerManager::registeredUserCount() const {
         if (_users[i].active) ++count;
     }
     return count;
+}
+
+void LockerManager::listUsersToSerial(Stream& out) const {
+    out.printf("Registered users (%u/%u):\n", registeredUserCount(), Cfg::MAX_USERS);
+    for (uint8_t i = 0; i < Cfg::MAX_USERS; ++i) {
+        if (_users[i].active) {
+            out.printf("  [%02u] user_id=%s rfid=%s has_pin=%s\n",
+                       i,
+                       _users[i].userId,
+                       _users[i].uid[0] ? _users[i].uid : "(none)",
+                       _users[i].pinHash[0] ? "yes" : "no");
+        }
+    }
 }
 
 int LockerManager::findRegisteredUserByUid(const String& uid) const {
@@ -209,7 +228,7 @@ int LockerManager::findAssignedLockerByPin(const String& pin) const {
 }
 
 // ============================================================
-// ASSIGN & UNLOCK-RELEASE FLOWS
+// ASSIGN & SINGLE-USE UNLOCK-RELEASE FLOWS
 // ============================================================
 
 ActionStatus LockerManager::assignToUser(int userIdx, const char* method, String& lockerName) {
@@ -219,14 +238,12 @@ ActionStatus LockerManager::assignToUser(int userIdx, const char* method, String
 
     const UserRecord& u = _users[userIdx];
 
-    // Enforce max 1 assigned locker per user
     const int existing = findAssignedLockerByUserId(u.userId);
     if (existing >= 0) {
         lockerName = Cfg::LOCKER_IDS[existing];
         return ActionStatus::ALREADY_ASSIGNED;
     }
 
-    // Claim first available locker
     for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
         if (isAssigned(_records[i])) continue;
 
@@ -276,7 +293,6 @@ ActionStatus LockerManager::releaseUnlockedLocker(int lockerIdx, const char* met
     LockerRecord& r = _records[lockerIdx];
     lockerName = Cfg::LOCKER_IDS[lockerIdx];
 
-    // Check if >24h deadline has passed
     if (isExpiredHold(r) || (r.expiresAt > 0 && _clock->valid() && _clock->nowUtc() >= r.expiresAt)) {
         if (!isExpiredHold(r)) {
             r.flags |= 0x02;
@@ -288,7 +304,6 @@ ActionStatus LockerManager::releaseUnlockedLocker(int lockerIdx, const char* met
     char userIdCopy[25];
     strlcpy(userIdCopy, r.userId, sizeof(userIdCopy));
 
-    // Clear assignment immediately so locker returns to AVAILABLE
     _records[lockerIdx] = LockerRecord{};
     saveLocker(lockerIdx);
 
@@ -321,7 +336,127 @@ ActionStatus LockerManager::unlockAndReleaseByPin(const String& pin, String& loc
 }
 
 // ============================================================
-// REMOTE & ADMIN OPERATIONS
+// D-MODE SELF-SERVICE RFID REGISTRATION VIA APP OTP
+// ============================================================
+
+bool LockerManager::registerPendingOtp(const String& userId, const String& otp) {
+    if (userId.isEmpty() || otp.length() < Cfg::PIN_MIN_LENGTH || otp.length() > Cfg::PIN_MAX_LENGTH) {
+        return false;
+    }
+
+    const uint32_t now = millis();
+    int slot = -1;
+
+    for (uint8_t i = 0; i < Cfg::MAX_PENDING_OTPS; ++i) {
+        if (_otps[i].active && static_cast<int32_t>(now - _otps[i].expiresAtMs) >= 0) {
+            _otps[i] = PendingOtp{};
+        }
+        if (_otps[i].active && userId.equalsIgnoreCase(_otps[i].userId)) {
+            slot = i;
+            break;
+        }
+        if (!_otps[i].active && slot < 0) {
+            slot = i;
+        }
+    }
+
+    if (slot < 0) slot = 0;
+
+    PendingOtp entry{};
+    entry.active = true;
+    strlcpy(entry.userId, userId.c_str(), sizeof(entry.userId));
+    strlcpy(entry.otp, otp.c_str(), sizeof(entry.otp));
+    entry.expiresAtMs = now + Cfg::OTP_TTL_MS;
+    _otps[slot] = entry;
+    return true;
+}
+
+bool LockerManager::verifyOtp(const String& otp, String& outUserId) {
+    if (otp.isEmpty()) return false;
+    const uint32_t now = millis();
+
+    for (uint8_t i = 0; i < Cfg::MAX_PENDING_OTPS; ++i) {
+        if (!_otps[i].active) continue;
+        if (static_cast<int32_t>(now - _otps[i].expiresAtMs) >= 0) {
+            _otps[i] = PendingOtp{};
+            continue;
+        }
+        if (otp == _otps[i].otp) {
+            outUserId = _otps[i].userId;
+            return true;
+        }
+    }
+    return false;
+}
+
+ActionStatus LockerManager::completeOtpRfidRegistration(const String& otp, const String& uid,
+                                                        String& outUserId) {
+    if (uid.isEmpty()) return ActionStatus::UNAUTHORIZED;
+
+    const uint32_t now = millis();
+    int otpIdx = -1;
+    for (uint8_t i = 0; i < Cfg::MAX_PENDING_OTPS; ++i) {
+        if (_otps[i].active && static_cast<int32_t>(now - _otps[i].expiresAtMs) < 0 &&
+            otp == _otps[i].otp) {
+            otpIdx = i;
+            break;
+        }
+    }
+    if (otpIdx < 0) return ActionStatus::EXPIRED;
+
+    outUserId = _otps[otpIdx].userId;
+
+    // Prevent binding a card that already belongs to another registered account
+    const int existingOwner = findRegisteredUserByUid(uid);
+    if (existingOwner >= 0 && !outUserId.equalsIgnoreCase(_users[existingOwner].userId)) {
+        if (_network) _network->publishRfidRegAck(outUserId, uid, false, "RFID_ALREADY_IN_USE");
+        return ActionStatus::ALREADY_ASSIGNED;
+    }
+
+    // Locate or create user slot in NVS database
+    int userSlot = -1;
+    for (uint8_t i = 0; i < Cfg::MAX_USERS; ++i) {
+        if (_users[i].active && outUserId.equalsIgnoreCase(_users[i].userId)) {
+            userSlot = i;
+            break;
+        }
+        if (!_users[i].active && userSlot < 0) {
+            userSlot = i;
+        }
+    }
+    if (userSlot < 0) {
+        if (_network) _network->publishRfidRegAck(outUserId, uid, false, "USER_DB_FULL");
+        return ActionStatus::NO_LOCKER_FREE;
+    }
+
+    UserRecord u = _users[userSlot];
+    u.active = 1;
+    strlcpy(u.userId, outUserId.c_str(), sizeof(u.userId));
+    strlcpy(u.uid, uid.c_str(), sizeof(u.uid));
+    _users[userSlot] = u;
+    _storage->saveUser(userSlot, u);
+
+    // Update active locker if this user currently holds one
+    const int lockerIdx = findAssignedLockerByUserId(outUserId);
+    if (lockerIdx >= 0) {
+        strlcpy(_records[lockerIdx].uid, uid.c_str(), sizeof(_records[lockerIdx].uid));
+        saveLocker(lockerIdx);
+    }
+
+    // Consume OTP (single-use)
+    _otps[otpIdx] = PendingOtp{};
+
+    // Emit durable event to NVS queue + immediate ACK to backend
+    emitEvent("RFID_REGISTERED", 0xFF, uid.c_str(), outUserId.c_str());
+    if (_network) {
+        _network->publishRfidRegAck(outUserId, uid, true, "REGISTERED");
+    }
+
+    return ActionStatus::OK;
+}
+
+// ============================================================
+// REMOTE, ADMIN & USER DB SYNC
 // ============================================================
 
 bool LockerManager::remoteSetLock(uint8_t index, bool locked, const char* source) {
@@ -339,15 +474,10 @@ bool LockerManager::release(uint8_t index, const char* source) {
     _records[index] = LockerRecord{};
     saveLocker(index);
 
-    // Unlock briefly so operator can retrieve items, or lock if door is closed
     if (!setLock(index, false, source)) return false;
     emitEvent("LOCKER_RELEASED", index, source, prevUser);
     return true;
 }
-
-// ============================================================
-// TWO-WAY USER DATABASE SYNC
-// ============================================================
 
 bool LockerManager::upsertUser(const String& userId, const String& uid,
                                const String& salt, const String& pinHash) {
@@ -363,7 +493,6 @@ bool LockerManager::upsertUser(const String& userId, const String& uid,
             targetSlot = i;
         }
     }
-
     if (targetSlot < 0) return false;
 
     UserRecord u{};
@@ -376,7 +505,6 @@ bool LockerManager::upsertUser(const String& userId, const String& uid,
     _users[targetSlot] = u;
     _storage->saveUser(targetSlot, u);
 
-    // Also update active locker credentials if user currently holds a locker
     const int lockerIdx = findAssignedLockerByUserId(userId);
     if (lockerIdx >= 0) {
         strlcpy(_records[lockerIdx].uid, uid.c_str(), sizeof(_records[lockerIdx].uid));
@@ -384,7 +512,6 @@ bool LockerManager::upsertUser(const String& userId, const String& uid,
         strlcpy(_records[lockerIdx].pinHash, pinHash.c_str(), sizeof(_records[lockerIdx].pinHash));
         saveLocker(lockerIdx);
     }
-
     return true;
 }
 
@@ -407,14 +534,9 @@ void LockerManager::clearUsers() {
     _storage->clearAllUsers();
 }
 
-// ============================================================
-// BACKGROUND TIMERS & DOOR MONITORING
-// ============================================================
-
 void LockerManager::checkExpirationsAndDoorAlerts() {
     const uint32_t nowMs = millis();
 
-    // 1. Check for doors left open > 60 seconds
     for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
         if (!_hardware->doorClosed(i)) {
             if (_doorOpenedAt[i] == 0) _doorOpenedAt[i] = nowMs;
@@ -431,7 +553,6 @@ void LockerManager::checkExpirationsAndDoorAlerts() {
         }
     }
 
-    // 2. Check 24-hour rental expiration
     if (!_clock->valid()) return;
     const uint64_t nowUtc = _clock->nowUtc();
 
@@ -439,7 +560,6 @@ void LockerManager::checkExpirationsAndDoorAlerts() {
         LockerRecord& r = _records[i];
         if (!isAssigned(r)) continue;
 
-        // Backfill deadline if assigned while NTP clock was still syncing
         if (r.expiresAt == 0) {
             r.assignedAt = nowUtc;
             r.expiresAt = nowUtc + Cfg::RENTAL_SECONDS;
@@ -465,7 +585,6 @@ void LockerManager::tick() {
                 _doorTimeoutReported[i] = false;
                 emitEvent("DOOR_CLOSED", i, "REED", _records[i].userId);
 
-                // Always auto-lock when door closes (both ASSIGNED and AVAILABLE states)
                 if (setLock(i, true, "REED")) {
                     emitEvent("DOOR_CLOSED_AUTO_LOCKED", i, "REED", _records[i].userId);
                 }

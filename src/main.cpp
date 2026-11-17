@@ -1,5 +1,6 @@
 #include "App.h"
 #include <mbedtls/md.h>
+#include <cstdarg>
 #include <cstring>
 
 Storage gStorage;
@@ -8,6 +9,47 @@ Hardware gHardware;
 NetworkService gNetwork;
 LockerManager gLockers;
 UserInterface gUi;
+
+// ============================================================
+// IN-MEMORY RING-BUFFER DEBUG LOGGER
+// ============================================================
+
+static String debugLogs[Cfg::DEBUG_LOG_CAPACITY];
+static uint8_t debugLogHead = 0;
+static uint8_t debugLogCount = 0;
+
+void appLog(const char* level, const char* fmt, ...) {
+    char msg[192];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, args);
+    va_end(args);
+
+    char line[224];
+    snprintf(line, sizeof(line), "[%lu ms][%s] %s",
+             static_cast<unsigned long>(millis()), level, msg);
+
+    Serial.println(line);
+
+    debugLogs[debugLogHead] = String(line);
+    debugLogHead = static_cast<uint8_t>((debugLogHead + 1) % Cfg::DEBUG_LOG_CAPACITY);
+    if (debugLogCount < Cfg::DEBUG_LOG_CAPACITY) ++debugLogCount;
+}
+
+static void printDebugLogs() {
+    Serial.printf("--- RAM DEBUG LOG (%u entries) ---\n", debugLogCount);
+    const uint8_t start = (debugLogHead + Cfg::DEBUG_LOG_CAPACITY - debugLogCount) % Cfg::DEBUG_LOG_CAPACITY;
+    for (uint8_t i = 0; i < debugLogCount; ++i) {
+        const uint8_t idx = (start + i) % Cfg::DEBUG_LOG_CAPACITY;
+        Serial.println(debugLogs[idx]);
+    }
+    Serial.println(F("--- END RAM LOG ---"));
+    gStorage.dumpSdLog(Serial);
+}
+
+// ============================================================
+// CRYPTO & REPLAY PROTECTION
+// ============================================================
 
 static String nonceHistory[24];
 static uint8_t nonceIndex = 0;
@@ -71,9 +113,6 @@ static bool secureEqual(const String& a, const String& b) {
     return diff == 0;
 }
 
-// Generic signed packet verifier:
-// Expected format: F0|F1|...|F(N-2)|SIGNATURE
-// where F(N-3) = TIMESTAMP and F(N-2) = NONCE
 bool verifySignedPacket(const String& packet, uint8_t expectedFields,
                         String* outFields, String& errorReason) {
     if (expectedFields < 4 || expectedFields > 10) {
@@ -145,8 +184,7 @@ bool verifySignedPacket(const String& packet, uint8_t expectedFields,
 }
 
 // ============================================================
-// REMOTE COMMAND HANDLER
-// Format: LOCKER_ID|ACTION|TIMESTAMP|NONCE|COMMAND_ID|SIGNATURE
+// REMOTE COMMAND & USER SYNC HANDLERS
 // ============================================================
 
 static void handleRemoteCommand(const String& command) {
@@ -199,27 +237,21 @@ static void handleRemoteCommand(const String& command) {
                            lockerId + '|' + commandId + '|' + result;
         gNetwork.publishAck(index, ack);
         if (valid) cacheCommand(lockerId, commandId, ack);
-        Serial.println(ack);
+        appLog("CMD", "%s", ack.c_str());
 
-        // Display successful remote command on TFT for 3 seconds
         if (accepted) {
             gUi.notifyRemoteCommand(String("REMOTE ") + action, lockerId, false);
         }
     } else {
-        Serial.printf("Rejected command: %s\n", result.c_str());
+        appLog("WARN", "Rejected command: %s", result.c_str());
     }
 }
 
-// ============================================================
-// TWO-WAY USER DATABASE SYNC HANDLER
-// Formats:
-//   UPSERT|USER_ID|RFID_UID|SALT|PIN_HASH|TIMESTAMP|NONCE|SIGNATURE (8 fields)
-//   DELETE|USER_ID|TIMESTAMP|NONCE|SIGNATURE (5 fields)
-//   CLEAR|TIMESTAMP|NONCE|SIGNATURE (4 fields)
-// ============================================================
-
 static void handleUserSync(const String& message) {
-    String op = message.substring(0, message.indexOf('|'));
+    const int firstPipe = message.indexOf('|');
+    if (firstPipe <= 0) return;
+
+    String op = message.substring(0, firstPipe);
     op.trim();
     op.toUpperCase();
 
@@ -228,34 +260,73 @@ static void handleUserSync(const String& message) {
 
     if (op == "UPSERT") {
         if (!verifySignedPacket(message, 8, fields, reason)) {
-            Serial.printf("UserSync UPSERT rejected: %s\n", reason.c_str());
+            appLog("WARN", "UserSync UPSERT rejected: %s", reason.c_str());
             return;
         }
         const bool ok = gLockers.upsertUser(fields[1], fields[2], fields[3], fields[4]);
-        Serial.printf("UserSync UPSERT %s: %s (total=%u)\n",
-                      fields[1].c_str(), ok ? "OK" : "FULL", gLockers.registeredUserCount());
+        appLog("SYNC", "UPSERT %s: %s (total=%u)",
+               fields[1].c_str(), ok ? "OK" : "FULL", gLockers.registeredUserCount());
+    } else if (op == "RFID_OTP") {
+        // Format: RFID_OTP|USER_ID|OTP_CODE|TIMESTAMP|NONCE|SIGNATURE
+        if (!verifySignedPacket(message, 6, fields, reason)) {
+            appLog("WARN", "UserSync RFID_OTP rejected: %s", reason.c_str());
+            return;
+        }
+        const bool ok = gLockers.registerPendingOtp(fields[1], fields[2]);
+        appLog("SYNC", "RFID_OTP for %s: %s", fields[1].c_str(), ok ? "QUEUED" : "INVALID");
     } else if (op == "DELETE") {
         if (!verifySignedPacket(message, 5, fields, reason)) {
-            Serial.printf("UserSync DELETE rejected: %s\n", reason.c_str());
+            appLog("WARN", "UserSync DELETE rejected: %s", reason.c_str());
             return;
         }
         const bool ok = gLockers.deleteUser(fields[1]);
-        Serial.printf("UserSync DELETE %s: %s\n", fields[1].c_str(), ok ? "OK" : "NOT_FOUND");
+        appLog("SYNC", "DELETE %s: %s", fields[1].c_str(), ok ? "OK" : "NOT_FOUND");
     } else if (op == "CLEAR") {
         if (!verifySignedPacket(message, 4, fields, reason)) {
-            Serial.printf("UserSync CLEAR rejected: %s\n", reason.c_str());
+            appLog("WARN", "UserSync CLEAR rejected: %s", reason.c_str());
             return;
         }
         gLockers.clearUsers();
-        Serial.println(F("UserSync CLEAR: OK"));
+        appLog("SYNC", "CLEAR users: OK");
     } else {
-        Serial.printf("UserSync unknown op: %s\n", op.c_str());
+        appLog("WARN", "UserSync unknown op: %s", op.c_str());
     }
 }
 
 // ============================================================
-// SERIAL CONSOLE COMMANDS (USB CDC)
+// EXPANDED SERIAL CONSOLE COMMANDS
 // ============================================================
+
+static int parseLockerArg(const String& rawArg) {
+    String arg = rawArg;
+    arg.trim();
+    if (arg.length() == 1 && arg[0] >= '1' && arg[0] <= '9') {
+        const int idx = arg[0] - '1';
+        return (idx >= 0 && idx < Cfg::LOCKER_COUNT) ? idx : -1;
+    }
+    return gLockers.findLockerId(arg);
+}
+
+static void printSerialHelp() {
+    Serial.println(F("=== Smart Locker Serial Commands ==="));
+    Serial.println(F("  STATUS                              - Show locker, user & network summary"));
+    Serial.println(F("  DIAG                                - Show peripheral health, heap & RSSI"));
+    Serial.println(F("  TIME                                - Show current local WIB time"));
+    Serial.println(F("  LOCK <LOCKER_001|1..4>              - Force lock compartment"));
+    Serial.println(F("  UNLOCK <LOCKER_001|1..4>            - Force unlock compartment"));
+    Serial.println(F("  RELEASE <LOCKER_001|1..4>           - Force release & clear assignment"));
+    Serial.println(F("  FORCE_ACK <LOCKER_001|1..4> [MSG]   - Publish manual ACK & state to MQTT"));
+    Serial.println(F("  PUSH_STATES                         - Broadcast all 4 locker states to MQTT"));
+    Serial.println(F("  SYNC_PULL                           - Request user DB sync from backend"));
+    Serial.println(F("  FLUSH_QUEUE                         - Drain queued NVS events to MQTT now"));
+    Serial.println(F("  ADD_USER_PIN <UID> <RFID|-> <PIN>   - Add/update local user with plain PIN"));
+    Serial.println(F("  DEL_USER <USER_ID>                  - Remove user from local NVS DB"));
+    Serial.println(F("  LIST_USERS                          - List all synced users in NVS"));
+    Serial.println(F("  WIFI <SSID> <PASSWORD>              - Overwrite Wi-Fi in NVS & reconnect"));
+    Serial.println(F("  WIFI_RESET                          - Revert Wi-Fi to Config.h defaults"));
+    Serial.println(F("  LOGS                                - Print RAM ring-buffer & SD logs"));
+    Serial.println(F("  CLEAR_LOGS                          - Clear RAM & SD logs"));
+}
 
 static void handleSerial() {
     while (Serial.available()) {
@@ -269,45 +340,163 @@ static void handleSerial() {
         serialBuffer.trim();
         if (serialBuffer.isEmpty()) continue;
 
-        if (serialBuffer.startsWith("UPSERT|") || serialBuffer.startsWith("DELETE|") || serialBuffer.startsWith("CLEAR|")) {
+        // Pass raw signed packets directly to protocol handlers
+        if (serialBuffer.startsWith("UPSERT|") || serialBuffer.startsWith("RFID_OTP|") ||
+            serialBuffer.startsWith("DELETE|") || serialBuffer.startsWith("CLEAR|")) {
             handleUserSync(serialBuffer);
-        } else if (serialBuffer.indexOf('|') >= 0) {
-            handleRemoteCommand(serialBuffer);
-        } else {
-            String input = serialBuffer;
-            input.toUpperCase();
-
-            if (input == "STATUS") {
-                Serial.printf("Available: %u/%u | Overdue(>24h): %u | Registered Users: %u\n",
-                              gLockers.availableCount(), Cfg::LOCKER_COUNT,
-                              gLockers.problematicCount(), gLockers.registeredUserCount());
-                for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
-                    const LockerRecord& r = gLockers.record(i);
-                    Serial.printf("%s assigned=%u expired=%u locked=%u door=%s user=%s\n",
-                                  Cfg::LOCKER_IDS[i], isAssigned(r), isExpiredHold(r),
-                                  gLockers.isLocked(i),
-                                  gHardware.doorClosed(i) ? "CLOSED" : "OPEN",
-                                  r.userId);
-                }
-            } else if (input == "TIME") {
-                char t[32];
-                gClock.formatLocal(t, sizeof(t));
-                Serial.println(t);
-            } else if (input.startsWith("LOCK ") || input.startsWith("UNLOCK ") || input.startsWith("RELEASE ")) {
-                const bool isLock = input.startsWith("LOCK ");
-                const bool isRelease = input.startsWith("RELEASE ");
-                const String id = input.substring(isRelease ? 8 : (isLock ? 5 : 7));
-                const int i = gLockers.findLockerId(id);
-                if (i >= 0) {
-                    if (isRelease) gLockers.release(i, "SERIAL");
-                    else gLockers.remoteSetLock(i, isLock, "SERIAL");
-                } else {
-                    Serial.println(F("Unknown locker ID"));
-                }
-            } else {
-                Serial.println(F("Commands: STATUS, TIME, LOCK LOCKER_001, UNLOCK LOCKER_001, RELEASE LOCKER_001"));
-            }
+            serialBuffer = "";
+            continue;
         }
+        if (serialBuffer.indexOf('|') >= 0 && !serialBuffer.startsWith("WIFI ")) {
+            handleRemoteCommand(serialBuffer);
+            serialBuffer = "";
+            continue;
+        }
+
+        String upper = serialBuffer;
+        upper.toUpperCase();
+
+        if (upper == "HELP") {
+            printSerialHelp();
+        } else if (upper == "STATUS") {
+            Serial.printf("WiFi:%s (%s) | MQTT:%s | Available:%u/%u | Overdue:%u | Users:%u | Queue:%u\n",
+                          gNetwork.wifiConnected() ? "UP" : "DOWN",
+                          gNetwork.currentSsid().c_str(),
+                          gNetwork.mqttConnected() ? "UP" : "DOWN",
+                          gLockers.availableCount(), Cfg::LOCKER_COUNT,
+                          gLockers.problematicCount(),
+                          gLockers.registeredUserCount(),
+                          gStorage.queueCount());
+            for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
+                const LockerRecord& r = gLockers.record(i);
+                Serial.printf("  %s: assigned=%u expired=%u locked=%u door=%s user=%s\n",
+                              Cfg::LOCKER_IDS[i], isAssigned(r), isExpiredHold(r),
+                              gLockers.isLocked(i),
+                              gHardware.doorClosed(i) ? "CLOSED" : "OPEN",
+                              r.userId[0] ? r.userId : "-");
+            }
+        } else if (upper == "DIAG") {
+            Serial.printf("Heap free: %u bytes | WiFi RSSI: %d dBm | TLS: %s\n",
+                          ESP.getFreeHeap(),
+                          gNetwork.wifiConnected() ? WiFi.RSSI() : 0,
+                          Cfg::MQTT_USE_TLS ? "ON" : "OFF");
+            Serial.printf("Peripherals -> Keypad(PCF8575):%s | RFID:%s | TFT:%s | SD:%s | ExtRTC:%s\n",
+                          gHardware.keypadReady() ? "OK" : "FAIL",
+                          gHardware.rfidReady() ? "OK" : "FAIL",
+                          gHardware.displayReady() ? "OK" : "FAIL",
+                          gStorage.sdReady() ? "OK" : "ABSENT",
+                          gClock.externalRtcReady() ? "OK" : "ABSENT");
+        } else if (upper == "TIME") {
+            char t[32];
+            gClock.formatLocal(t, sizeof(t));
+            Serial.println(t);
+        } else if (upper.startsWith("LOCK ") || upper.startsWith("UNLOCK ") || upper.startsWith("RELEASE ")) {
+            const bool isLock = upper.startsWith("LOCK ");
+            const bool isRelease = upper.startsWith("RELEASE ");
+            const String arg = serialBuffer.substring(isRelease ? 8 : (isLock ? 5 : 7));
+            const int idx = parseLockerArg(arg);
+            if (idx >= 0) {
+                if (isRelease) gLockers.release(idx, "SERIAL");
+                else gLockers.remoteSetLock(idx, isLock, "SERIAL");
+            } else {
+                Serial.println(F("Invalid locker ID (use LOCKER_001..004 or 1..4)"));
+            }
+        } else if (upper.startsWith("FORCE_ACK ")) {
+            String rest = serialBuffer.substring(10);
+            rest.trim();
+            const int sp = rest.indexOf(' ');
+            const String target = (sp > 0) ? rest.substring(0, sp) : rest;
+            const String note = (sp > 0) ? rest.substring(sp + 1) : "MANUAL_SYNC";
+            const int idx = parseLockerArg(target);
+            if (idx >= 0) {
+                const String ack = String("ACCEPTED|") + Cfg::LOCKER_IDS[idx] + "|SERIAL|" + note;
+                const bool ok = gNetwork.publishAck(idx, ack);
+                gLockers.broadcastAllStates("SERIAL_ACK");
+                appLog("SERIAL", "FORCE_ACK %s -> %s", ack.c_str(), ok ? "SENT" : "MQTT_OFFLINE");
+            } else {
+                Serial.println(F("Invalid locker ID"));
+            }
+        } else if (upper == "PUSH_STATES") {
+            gLockers.broadcastAllStates("SERIAL_PUSH");
+            appLog("SERIAL", "Published all locker states to MQTT");
+        } else if (upper == "SYNC_PULL") {
+            const bool ok = gNetwork.publishUserSyncRequest(gLockers.registeredUserCount());
+            appLog("SERIAL", "SYNC_PULL requested -> %s", ok ? "SENT" : "MQTT_OFFLINE");
+        } else if (upper == "FLUSH_QUEUE") {
+            uint8_t flushed = 0;
+            String pending;
+            while (gNetwork.mqttConnected() && gStorage.peek(pending)) {
+                if (gNetwork.publishEvent(pending)) {
+                    gStorage.pop();
+                    ++flushed;
+                } else {
+                    break;
+                }
+            }
+            appLog("SERIAL", "FLUSH_QUEUE drained %u events (remaining=%u)",
+                   flushed, gStorage.queueCount());
+        } else if (upper.startsWith("ADD_USER_PIN ")) {
+            String rest = serialBuffer.substring(13);
+            rest.trim();
+            const int s1 = rest.indexOf(' ');
+            const int s2 = (s1 > 0) ? rest.indexOf(' ', s1 + 1) : -1;
+            if (s1 > 0 && s2 > s1) {
+                String uidArg = rest.substring(0, s1);
+                String rfidArg = rest.substring(s1 + 1, s2);
+                String pinArg = rest.substring(s2 + 1);
+                uidArg.trim();
+                rfidArg.trim();
+                pinArg.trim();
+                if (rfidArg == "-" || rfidArg.equalsIgnoreCase("NONE")) rfidArg = "";
+
+                char salt[17];
+                const uint64_t rnd = (static_cast<uint64_t>(esp_random()) << 32) | esp_random();
+                snprintf(salt, sizeof(salt), "%016llx", static_cast<unsigned long long>(rnd));
+                const String hash = makePinHash(salt, pinArg);
+
+                const bool ok = !hash.isEmpty() && gLockers.upsertUser(uidArg, rfidArg, salt, hash);
+                appLog("SERIAL", "ADD_USER_PIN %s -> %s", uidArg.c_str(), ok ? "OK" : "FAILED");
+            } else {
+                Serial.println(F("Usage: ADD_USER_PIN <USER_ID> <RFID_UID|-> <PIN>"));
+            }
+        } else if (upper.startsWith("DEL_USER ")) {
+            String uidArg = serialBuffer.substring(9);
+            uidArg.trim();
+            const bool ok = gLockers.deleteUser(uidArg);
+            appLog("SERIAL", "DEL_USER %s -> %s", uidArg.c_str(), ok ? "REMOVED" : "NOT_FOUND");
+        } else if (upper == "LIST_USERS") {
+            gLockers.listUsersToSerial(Serial);
+        } else if (upper.startsWith("WIFI ")) {
+            String rest = serialBuffer.substring(5);
+            rest.trim();
+            int sep = rest.indexOf('|');
+            if (sep < 0) sep = rest.indexOf(' ');
+            if (sep > 0) {
+                String newSsid = rest.substring(0, sep);
+                String newPass = rest.substring(sep + 1);
+                newSsid.trim();
+                newPass.trim();
+                gStorage.saveWifiOverride(newSsid, newPass);
+                gNetwork.setWifiCredentials(newSsid, newPass);
+                appLog("SERIAL", "Wi-Fi updated in NVS -> SSID: %s", newSsid.c_str());
+            } else {
+                Serial.println(F("Usage: WIFI <SSID> <PASSWORD> (or WIFI <SSID>|<PASSWORD>)"));
+            }
+        } else if (upper == "WIFI_RESET") {
+            gStorage.clearWifiOverride();
+            gNetwork.setWifiCredentials(Cfg::WIFI_SSID, Cfg::WIFI_PASSWORD);
+            appLog("SERIAL", "Wi-Fi reverted to Config.h default (%s)", Cfg::WIFI_SSID);
+        } else if (upper == "LOGS") {
+            printDebugLogs();
+        } else if (upper == "CLEAR_LOGS") {
+            debugLogHead = 0;
+            debugLogCount = 0;
+            gStorage.clearSdLog();
+            Serial.println(F("RAM and SD logs cleared."));
+        } else {
+            Serial.println(F("Unknown command. Type HELP for available commands."));
+        }
+
         serialBuffer = "";
     }
 }
@@ -319,7 +508,7 @@ static void handleSerial() {
 void setup() {
     Serial.begin(115200);
     delay(200);
-    Serial.println(F("Smart Locker | ESP32-S3 N16R8 | Revised Firmware"));
+    appLog("INFO", "Smart Locker | ESP32-S3 N16R8 | v2.1 Boot");
 
     gHardware.begin();
     gClock.begin();
@@ -335,13 +524,19 @@ void setup() {
     gLockers.begin(gStorage, gHardware, gClock, gNetwork);
     gNetwork.setCommandHandler(handleRemoteCommand);
     gNetwork.setUserSyncHandler(handleUserSync);
-    gNetwork.begin();
-    gUi.begin(gHardware, gLockers, gClock, gNetwork);
 
-    Serial.printf("Users loaded: %u | SD: %s | Keypad: %s\n",
-                  gLockers.registeredUserCount(),
-                  gStorage.sdReady() ? "ready" : "optional/absent",
-                  gHardware.keypadReady() ? "ready" : "missing");
+    String savedSsid, savedPass;
+    if (gStorage.loadWifiOverride(savedSsid, savedPass)) {
+        appLog("INFO", "Using NVS Wi-Fi override: %s", savedSsid.c_str());
+        gNetwork.begin(savedSsid.c_str(), savedPass.c_str());
+    } else {
+        gNetwork.begin();
+    }
+
+    gUi.begin(gHardware, gLockers, gClock, gNetwork);
+    appLog("INFO", "Ready | Users:%u | SD:%s | Type HELP for Serial commands",
+           gLockers.registeredUserCount(),
+           gStorage.sdReady() ? "ready" : "absent");
 }
 
 void loop() {
@@ -361,7 +556,6 @@ void loop() {
     gLockers.tick();
     handleSerial();
 
-    // Drain offline NVS telemetry queue at max 1 event per 250 ms
     const uint32_t now = millis();
     if (gNetwork.mqttConnected() && now - lastSyncAttempt >= 250) {
         lastSyncAttempt = now;
@@ -371,20 +565,9 @@ void loop() {
         }
     }
 
-    // Periodic full locker state heartbeat every 30 seconds
     static uint32_t lastStateBroadcast = 0;
     if (gNetwork.mqttConnected() && now - lastStateBroadcast >= 30000) {
         lastStateBroadcast = now;
-        for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
-            const LockerRecord& r = gLockers.record(i);
-            gNetwork.publishLockerState(
-                i,
-                gLockers.isLocked(i),
-                isAssigned(r),
-                isExpiredHold(r),
-                r.userId,
-                "HEARTBEAT"
-            );
-        }
+        gLockers.broadcastAllStates("HEARTBEAT");
     }
 }

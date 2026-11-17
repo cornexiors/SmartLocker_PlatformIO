@@ -11,11 +11,16 @@ bool Storage::begin() {
         _prefs.end();
         return false;
     }
+    if (!_netCfg.begin("lockercfg", false)) {
+        _queue.end();
+        _users.end();
+        _prefs.end();
+        return false;
+    }
 
     _head = _queue.getUChar("head", 0) % Cfg::SYNC_QUEUE_CAPACITY;
     _tail = _queue.getUChar("tail", 0) % Cfg::SYNC_QUEUE_CAPACITY;
 
-    // microSD is optional; system operates normally without it
     _sdReady = SD.begin(Cfg::SD_CS, SPI, Cfg::SD_SPI_HZ);
     return true;
 }
@@ -90,10 +95,56 @@ void Storage::pop() {
     _queue.putUChar("head", _head);
 }
 
+uint8_t Storage::queueCount() const {
+    return static_cast<uint8_t>((_tail + Cfg::SYNC_QUEUE_CAPACITY - _head) % Cfg::SYNC_QUEUE_CAPACITY);
+}
+
+void Storage::saveWifiOverride(const String& ssid, const String& password) {
+    _netCfg.putString("ssid", ssid);
+    _netCfg.putString("pass", password);
+}
+
+bool Storage::loadWifiOverride(String& ssid, String& password) {
+    ssid = _netCfg.getString("ssid", "");
+    if (ssid.isEmpty()) return false;
+    password = _netCfg.getString("pass", "");
+    return true;
+}
+
+void Storage::clearWifiOverride() {
+    _netCfg.remove("ssid");
+    _netCfg.remove("pass");
+}
+
 void Storage::logEvent(const String& payload) {
     if (!_sdReady) return;
     File file = SD.open("/locker.log", FILE_APPEND);
     if (!file) return;
     file.println(payload);
     file.close();
+}
+
+void Storage::dumpSdLog(Stream& out) {
+    if (!_sdReady) {
+        out.println(F("SD card not present."));
+        return;
+    }
+    File file = SD.open("/locker.log", FILE_READ);
+    if (!file) {
+        out.println(F("No /locker.log file found on SD."));
+        return;
+    }
+    out.println(F("--- SD /locker.log ---"));
+    while (file.available()) {
+        out.write(file.read());
+    }
+    out.println(F("--- END SD LOG ---"));
+    file.close();
+}
+
+void Storage::clearSdLog() {
+    if (!_sdReady) return;
+    if (SD.exists("/locker.log")) {
+        SD.remove("/locker.log");
+    }
 }

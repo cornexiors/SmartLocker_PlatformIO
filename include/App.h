@@ -248,6 +248,7 @@ private:
 
     uint32_t _lastWifiAttempt = 0;
     uint32_t _lastMqttAttempt = 0;
+    uint32_t _mqttBackoffMs = Cfg::MQTT_RETRY_MS;
     uint8_t _cachedUserCount = 0;
 
     static NetworkService* _self;

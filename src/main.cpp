@@ -507,8 +507,9 @@ static void handleSerial() {
 
 void setup() {
     Serial.begin(115200);
-    delay(200);
-    appLog("INFO", "Smart Locker | ESP32-S3 N16R8 | v2.1 Boot");
+    delay(600); // Allow Windows USB CDC COM port to re-enumerate after reset
+    appLog("INFO", "Smart Locker | ESP32-S3 N16R8 | Reset reason: %d",
+           static_cast<int>(esp_reset_reason()));
 
     gHardware.begin();
     gClock.begin();

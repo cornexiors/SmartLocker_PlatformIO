@@ -8,18 +8,7 @@ void NetworkService::begin(const char* ssid, const char* password) {
     _password = password ? password : Cfg::WIFI_PASSWORD;
     _mqttBackoffMs = Cfg::MQTT_RETRY_MS;
 
-    if (Cfg::MQTT_USE_TLS) {
-        if (Cfg::MQTT_ROOT_CA[0] != '\0') {
-            _tlsClient.setCACert(Cfg::MQTT_ROOT_CA);
-        } else {
-            _tlsClient.setInsecure();
-        }
-        _tlsClient.setHandshakeTimeout(5); // Cap TLS handshake at 5s (default is 120s)
-        _mqtt.setClient(_tlsClient);
-    } else {
-        _mqtt.setClient(_plainClient);
-    }
-
+    _mqtt.setClient(_plainClient);
     _mqtt.setServer(Cfg::MQTT_HOST, Cfg::MQTT_PORT);
     _mqtt.setCallback(NetworkService::callback);
     _mqtt.setBufferSize(Cfg::MQTT_BUFFER_SIZE);
@@ -65,10 +54,6 @@ void NetworkService::tick() {
         return;
     }
 
-    if (Cfg::MQTT_USE_TLS && Cfg::MQTT_ROOT_CA[0] != '\0' && !gClock.valid()) {
-        return;
-    }
-
     if (!_mqtt.connected()) {
         if (now - _lastMqttAttempt >= _mqttBackoffMs) {
             _lastMqttAttempt = now;
@@ -80,12 +65,7 @@ void NetworkService::tick() {
 }
 
 void NetworkService::connectMqtt() {
-    // Free any previous socket / mbedTLS state before attempting a new connection
-    if (Cfg::MQTT_USE_TLS) {
-        _tlsClient.stop();
-    } else {
-        _plainClient.stop();
-    }
+    _plainClient.stop();
 
     char clientId[40];
     snprintf(clientId, sizeof(clientId), "locker-%llX",
@@ -95,14 +75,14 @@ void NetworkService::connectMqtt() {
     snprintf(willTopic, sizeof(willTopic), "%sdevice/status", Cfg::MQTT_BASE);
 
     if (!_mqtt.connect(clientId, willTopic, 1, true, "OFFLINE")) {
-        appLog("WARN", "MQTT connect failed (%d), retry in %lus",
-               _mqtt.state(), static_cast<unsigned long>(_mqttBackoffMs / 1000));
+        Serial.printf("MQTT connect failed (%d), retry in %lus\n",
+                      _mqtt.state(), static_cast<unsigned long>(_mqttBackoffMs / 1000));
         _mqttBackoffMs = min<uint32_t>(_mqttBackoffMs * 2, 30000);
         return;
     }
 
     _mqttBackoffMs = Cfg::MQTT_RETRY_MS;
-    appLog("INFO", "MQTT connected");
+    Serial.println(F("MQTT connected (plain 1883)"));
     _mqtt.publish(willTopic, "ONLINE", true);
 
     for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
@@ -110,12 +90,6 @@ void NetworkService::connectMqtt() {
         snprintf(topic, sizeof(topic), "%s%s/command", Cfg::MQTT_BASE, Cfg::LOCKER_IDS[i]);
         _mqtt.subscribe(topic, 1);
     }
-
-    char syncTopic[64];
-    snprintf(syncTopic, sizeof(syncTopic), "%susers/sync", Cfg::MQTT_BASE);
-    _mqtt.subscribe(syncTopic, 1);
-
-    publishUserSyncRequest(_cachedUserCount);
 }
 
 void NetworkService::callback(char* topic, byte* payload, unsigned int length) {
@@ -125,13 +99,6 @@ void NetworkService::callback(char* topic, byte* payload, unsigned int length) {
     message.reserve(length);
     for (unsigned int i = 0; i < length; ++i) {
         message += static_cast<char>(payload[i]);
-    }
-
-    char syncTopic[64];
-    snprintf(syncTopic, sizeof(syncTopic), "%susers/sync", Cfg::MQTT_BASE);
-    if (strcmp(topic, syncTopic) == 0) {
-        if (_self->_userSyncHandler) _self->_userSyncHandler(message);
-        return;
     }
 
     const int sep = message.indexOf('|');
@@ -158,21 +125,17 @@ bool NetworkService::publishEvent(const String& payload) {
     return _mqtt.publish(topic, payload.c_str(), false);
 }
 
-bool NetworkService::publishLockerState(uint8_t index, bool locked, bool assigned,
-                                        bool expired, const char* userId, const char* method) {
+bool NetworkService::publishLockerState(uint8_t index, bool locked, bool assigned, const char* method) {
     if (!mqttConnected() || index >= Cfg::LOCKER_COUNT) return false;
     char topic[64];
     snprintf(topic, sizeof(topic), "%s%s/state", Cfg::MQTT_BASE, Cfg::LOCKER_IDS[index]);
 
-    char json[220];
+    char json[180];
     snprintf(json, sizeof(json),
-             "{\"locker_id\":\"%s\",\"locked\":%s,\"assigned\":%s,\"expired\":%s,"
-             "\"user_id\":\"%s\",\"method\":\"%s\"}",
+             "{\"locker_id\":\"%s\",\"locked\":%s,\"assigned\":%s,\"method\":\"%s\"}",
              Cfg::LOCKER_IDS[index],
              locked ? "true" : "false",
              assigned ? "true" : "false",
-             expired ? "true" : "false",
-             userId ? userId : "",
              method ? method : "SYSTEM");
 
     return _mqtt.publish(topic, json, true);
@@ -185,41 +148,6 @@ bool NetworkService::publishAck(uint8_t index, const String& payload) {
     return _mqtt.publish(topic, payload.c_str(), false);
 }
 
-bool NetworkService::publishRfidRegAck(const String& userId, const String& uid,
-                                       bool success, const char* reason) {
-    if (!mqttConnected()) return false;
-    char topic[64];
-    snprintf(topic, sizeof(topic), "%susers/ack", Cfg::MQTT_BASE);
-
-    char payload[128];
-    snprintf(payload, sizeof(payload),
-             "RFID_REG_ACK|%s|%s|%s|%s",
-             userId.c_str(),
-             uid.c_str(),
-             success ? "ACCEPTED" : "REJECTED",
-             reason ? reason : "");
-
-    return _mqtt.publish(topic, payload, false);
-}
-
-bool NetworkService::publishUserSyncRequest(uint8_t userCount) {
-    _cachedUserCount = userCount;
-    if (!mqttConnected()) return false;
-    char topic[64];
-    snprintf(topic, sizeof(topic), "%susers/request", Cfg::MQTT_BASE);
-
-    char json[128];
-    snprintf(json, sizeof(json),
-             "{\"device_id\":\"%s\",\"action\":\"SYNC_REQUEST\",\"user_count\":%u}",
-             Cfg::DEVICE_ID, userCount);
-
-    return _mqtt.publish(topic, json, false);
-}
-
 void NetworkService::setCommandHandler(void (*handler)(const String&)) {
     _commandHandler = handler;
-}
-
-void NetworkService::setUserSyncHandler(void (*handler)(const String&)) {
-    _userSyncHandler = handler;
 }

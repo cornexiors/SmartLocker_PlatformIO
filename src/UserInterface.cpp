@@ -36,10 +36,12 @@ void UserInterface::returnHome() {
     }
 
     _state = HOME;
+    Serial.println(F("[UI] -> HOME"));
     _hw->drawHome(
         _net->wifiConnected(),
         _net->mqttConnected(),
-        _lockers->availableCount()
+        _lockers->availableCount(),
+        _hw->doorClosed(0)
     );
 }
 
@@ -49,7 +51,7 @@ void UserInterface::refreshCurrentScreen() {
 
     switch (_state) {
         case HOME:
-            _hw->drawHome(wifiOk, mqttOk, _lockers->availableCount());
+            _hw->drawHome(wifiOk, mqttOk, _lockers->availableCount(), _hw->doorClosed(0));
             break;
         case ASSIGN_CRED:
             _hw->drawCredentialPrompt(wifiOk, mqttOk, true, _pin.length());
@@ -88,10 +90,9 @@ void UserInterface::onRfidScanned(const String& uid) {
 }
 
 void UserInterface::onKey(char key) {
-    // 250ms cooldown prevents Column 3 (A/B/C/D) membrane bounce into 'C' (Back)
     static uint32_t lastAcceptedKeyMs = 0;
     const uint32_t now = millis();
-    if (now - lastAcceptedKeyMs < 250) return;
+    if (now - lastAcceptedKeyMs < 150) return;
     lastAcceptedKeyMs = now;
 
     _lastActivityMs = now;
@@ -171,37 +172,49 @@ void UserInterface::tick() {
         _lastKeyScan = now;
         const char key = _hw->scanKey();
         if (key == _rawKey) {
-            if (_keyStable < 2) ++_keyStable;
+            if (_keyStable < 3) ++_keyStable;
         } else {
             _rawKey = key;
             _keyStable = 0;
         }
-        if (_keyStable >= 2 && _stableKey != _rawKey) {
-            _stableKey = _rawKey;
-            if (_stableKey) onKey(_stableKey);
+
+        if (_keyStable >= 3) {
+            if (_rawKey == 0) {
+                _keyReleased = true;
+                _stableKey = 0;
+            } else if (_keyReleased && _stableKey != _rawKey) {
+                _keyReleased = false;
+                _stableKey = _rawKey;
+                Serial.printf("[UI] Accepted key '%c' in state %u\n",
+                              _stableKey, static_cast<unsigned>(_state));
+                onKey(_stableKey);
+            }
         }
     }
 
-    if (_state == RESULT && static_cast<int32_t>(now - _resultDeadline) >= 0) {
+    if (_state == RESULT && static_cast<int32_t>(millis() - _resultDeadline) >= 0) {
         returnHome();
         return;
     }
 
     if (_state != HOME && _state != RESULT &&
-        (now - _lastActivityMs >= Cfg::UI_IDLE_TIMEOUT_MS)) {
+        (millis() - _lastActivityMs >= Cfg::UI_IDLE_TIMEOUT_MS)) {
         returnHome();
         return;
     }
 
-    // Redraw Home screen immediately if Wi-Fi or MQTT state changes
+    // Redraw Home screen immediately if Wi-Fi, MQTT, or Door 1 reed state changes
     static bool lastShownWifi = false;
     static bool lastShownMqtt = false;
+    static bool lastShownDoor1 = true;
     const bool curWifi = _net->wifiConnected();
     const bool curMqtt = _net->mqttConnected();
+    const bool curDoor1 = _hw->doorClosed(0);
 
-    if (_state == HOME && (curWifi != lastShownWifi || curMqtt != lastShownMqtt)) {
+    if (_state == HOME && (curWifi != lastShownWifi || curMqtt != lastShownMqtt || curDoor1 != lastShownDoor1)) {
         lastShownWifi = curWifi;
         lastShownMqtt = curMqtt;
+        lastShownDoor1 = curDoor1;
         refreshCurrentScreen();
     }
 }

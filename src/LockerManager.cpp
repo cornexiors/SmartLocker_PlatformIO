@@ -247,6 +247,10 @@ void LockerManager::tick() {
     for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
         bool closed = false;
         if (_hardware->doorChanged(i, closed)) {
+            Serial.printf("[REED] %s (GPIO %u) -> %s\n",
+                          Cfg::LOCKER_IDS[i], Cfg::REED_PINS[i],
+                          closed ? "CLOSED" : "OPEN");
+            _hardware->beep(40);
             if (closed) {
                 emitEvent("DOOR_CLOSED", i, "REED");
                 if (setLock(i, true, "REED")) {

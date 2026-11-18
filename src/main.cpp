@@ -135,6 +135,22 @@ static void handleSerial() {
         } else if (upper == "RESET_ALL") {
             gLockers.resetAllLockers();
             Serial.println(F("All lockers cleared and locked."));
+        } else if (upper.startsWith("SERVO ")) {
+            // Usage: SERVO 1 0  or  SERVO 1 180
+            String rest = serialBuffer.substring(6);
+            rest.trim();
+            const int sp = rest.indexOf(' ');
+            if (sp > 0) {
+                const int idx = parseLockerArg(rest.substring(0, sp));
+                const int angle = rest.substring(sp + 1).toInt();
+                if (idx >= 0) {
+                    gHardware.setServoAngle(idx, angle);
+                } else {
+                    Serial.println(F("Invalid locker ID (use 1..4)"));
+                }
+            } else {
+                Serial.println(F("Usage: SERVO <1..4> <0..180>"));
+            }
         } else if (upper.startsWith("WIFI ")) {
             String rest = serialBuffer.substring(5);
             rest.trim();

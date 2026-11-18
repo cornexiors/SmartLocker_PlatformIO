@@ -34,11 +34,11 @@ constexpr uint8_t SERVO_PINS[LOCKER_COUNT] = {
     4, 21, 18, 16
 };
 
-constexpr int SERVO_LOCK_ANGLE = 180;
-constexpr int SERVO_UNLOCK_ANGLE = 0;
+constexpr int SERVO_LOCK_ANGLE = 170;
+constexpr int SERVO_UNLOCK_ANGLE = 10;
 
-constexpr uint16_t SERVO_MIN_US = 1000;
-constexpr uint16_t SERVO_MAX_US = 2000;
+constexpr uint16_t SERVO_MIN_US = 500;
+constexpr uint16_t SERVO_MAX_US = 2400;
 
 // ============================================================
 // PCF8575 I2C EXPANDER (4x4 KEYPAD)

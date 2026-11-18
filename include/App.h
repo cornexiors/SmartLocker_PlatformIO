@@ -69,13 +69,14 @@ public:
     bool doorChanged(uint8_t index, bool& closed);
 
     bool setLockerActuator(uint8_t index, bool locked);
+    bool setServoAngle(uint8_t index, int angle);
 
     void setLed(bool on);
     void beep(uint16_t durationMs = 60);
 
     // Graphic TFT UI (128x140)
     void drawTopBar(bool wifiOk, bool mqttOk, const char* title);
-    void drawHome(bool wifiOk, bool mqttOk, uint8_t available);
+    void drawHome(bool wifiOk, bool mqttOk, uint8_t available, bool door1Closed);
     void drawCredentialPrompt(bool wifiOk, bool mqttOk, bool assigning, uint8_t pinLength);
     void updateCredentialPin(uint8_t pinLength);
     void drawResult(bool wifiOk, bool mqttOk,
@@ -252,6 +253,7 @@ private:
     char _rawKey = 0;
     char _stableKey = 0;
     uint8_t _keyStable = 0;
+    bool _keyReleased = true;
 };
 
 extern Storage gStorage;

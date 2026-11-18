@@ -51,6 +51,9 @@ bool Hardware::begin() {
     pinMode(Cfg::LED_PIN, OUTPUT);
     digitalWrite(Cfg::LED_PIN, LOW);
 
+    ESP32PWM::allocateTimer(0);
+    ESP32PWM::allocateTimer(1);
+
     if (Cfg::BUZZER_ENABLED) {
         ledcSetup(BUZZER_LEDC_CH, Cfg::BUZZER_TONE_HZ, 8);
         ledcAttachPin(Cfg::BUZZER_PIN, BUZZER_LEDC_CH);
@@ -72,13 +75,15 @@ bool Hardware::begin() {
     _tft.setTextWrap(false);
     _displayReady = true;
 
+    pinMode(5, OUTPUT);
+    digitalWrite(5, HIGH);
+
     pinMode(Cfg::RFID_RST, OUTPUT);
     digitalWrite(Cfg::RFID_RST, HIGH);
     _rfid.PCD_Init();
-    _rfidReady = true;
-
-    ESP32PWM::allocateTimer(0);
-    ESP32PWM::allocateTimer(1);
+    _rfid.PCD_SetAntennaGain(MFRC522Constants::RxGain_max);
+    const byte rfidVer = static_cast<byte>(_rfid.PCD_GetVersion());
+    _rfidReady = (rfidVer != 0x00 && rfidVer != 0xFF);
 
     for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
         if (Cfg::REED_PINS[i] != Cfg::NO_PIN) {
@@ -96,9 +101,9 @@ bool Hardware::begin() {
         }
     }
 
-    Serial.printf("PCF8575:%s(0x%02X) | MFRC522:%s | ST7735:%s\n",
+    Serial.printf("PCF8575:%s(0x%02X) | MFRC522:%s(0x%02X) | ST7735:%s\n",
                   _pcfReady ? "ok" : "missing", _pcfAddress,
-                  _rfidReady ? "ok" : "fail",
+                  _rfidReady ? "ok" : "fail", rfidVer,
                   _displayReady ? "ok" : "fail");
     return true;
 }
@@ -179,6 +184,16 @@ bool Hardware::setLockerActuator(uint8_t index, bool locked) {
     return true;
 }
 
+bool Hardware::setServoAngle(uint8_t index, int angle) {
+    if (index >= Cfg::LOCKER_COUNT || Cfg::SERVO_PINS[index] == Cfg::NO_PIN) return false;
+    if (!_servos[index].attached()) return false;
+    const int clamped = constrain(angle, 0, 180);
+    _servos[index].write(clamped);
+    Serial.printf("[SERVO] %s (GPIO %u) -> %d deg\n",
+                  Cfg::LOCKER_IDS[index], Cfg::SERVO_PINS[index], clamped);
+    return true;
+}
+
 void Hardware::setLed(bool on) {
     digitalWrite(Cfg::LED_PIN, on ? HIGH : LOW);
 }
@@ -225,7 +240,7 @@ void Hardware::drawTopBar(bool wifiOk, bool mqttOk, const char* title) {
     drawConnectivityIcon(106, 3, wifiOk, mqttOk);
 }
 
-void Hardware::drawHome(bool wifiOk, bool mqttOk, uint8_t available) {
+void Hardware::drawHome(bool wifiOk, bool mqttOk, uint8_t available, bool door1Closed) {
     if (!_displayReady) return;
     _tft.fillScreen(ST77XX_BLACK);
     drawTopBar(wifiOk, mqttOk, "SMART LOCKER");
@@ -254,16 +269,22 @@ void Hardware::drawHome(bool wifiOk, bool mqttOk, uint8_t available) {
 
     _tft.setTextSize(1);
     _tft.setTextColor(COLOR_ACCENT);
-    _tft.setCursor(14, cursorY + 8);
+    _tft.setCursor(14, cursorY + 7);
     _tft.print(F("AVAILABLE LOCKERS"));
 
     _tft.setTextSize(2);
     _tft.setTextColor(available > 0 ? COLOR_OK : COLOR_ERR);
-    _tft.setCursor(42, cursorY + ((wifiOk && mqttOk) ? 32 : 25));
+    _tft.setCursor(42, cursorY + ((wifiOk && mqttOk) ? 24 : 19));
     _tft.print(available);
     _tft.setTextColor(ST77XX_WHITE);
     _tft.print(F("/"));
     _tft.print(Cfg::LOCKER_COUNT);
+
+    // Live Reed Switch Status for Locker 1 (GPIO 14)
+    _tft.setTextSize(1);
+    _tft.setTextColor(door1Closed ? COLOR_OK : COLOR_WARN);
+    _tft.setCursor(34, cursorY + cardH - 12);
+    _tft.print(door1Closed ? F("D1:CLOSED") : F("D1:OPEN"));
 
     const int16_t btnY = 114;
     _tft.fillRoundRect(4, btnY, 58, 22, 4, COLOR_ACCENT);

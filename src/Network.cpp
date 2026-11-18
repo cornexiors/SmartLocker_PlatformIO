@@ -6,6 +6,7 @@ void NetworkService::begin(const char* ssid, const char* password) {
     _self = this;
     _ssid = ssid ? ssid : Cfg::WIFI_SSID;
     _password = password ? password : Cfg::WIFI_PASSWORD;
+    _mqttBackoffMs = Cfg::MQTT_RETRY_MS;
 
     if (Cfg::MQTT_USE_TLS) {
         if (Cfg::MQTT_ROOT_CA[0] != '\0') {
@@ -13,6 +14,7 @@ void NetworkService::begin(const char* ssid, const char* password) {
         } else {
             _tlsClient.setInsecure();
         }
+        _tlsClient.setHandshakeTimeout(5); // Cap TLS handshake at 5s (default is 120s)
         _mqtt.setClient(_tlsClient);
     } else {
         _mqtt.setClient(_plainClient);
@@ -21,7 +23,7 @@ void NetworkService::begin(const char* ssid, const char* password) {
     _mqtt.setServer(Cfg::MQTT_HOST, Cfg::MQTT_PORT);
     _mqtt.setCallback(NetworkService::callback);
     _mqtt.setBufferSize(Cfg::MQTT_BUFFER_SIZE);
-    _mqtt.setSocketTimeout(3);
+    _mqtt.setSocketTimeout(2);
     _mqtt.setKeepAlive(20);
 
     WiFi.mode(WIFI_STA);
@@ -63,8 +65,12 @@ void NetworkService::tick() {
         return;
     }
 
+    if (Cfg::MQTT_USE_TLS && Cfg::MQTT_ROOT_CA[0] != '\0' && !gClock.valid()) {
+        return;
+    }
+
     if (!_mqtt.connected()) {
-        if (now - _lastMqttAttempt >= Cfg::MQTT_RETRY_MS) {
+        if (now - _lastMqttAttempt >= _mqttBackoffMs) {
             _lastMqttAttempt = now;
             connectMqtt();
         }
@@ -74,6 +80,13 @@ void NetworkService::tick() {
 }
 
 void NetworkService::connectMqtt() {
+    // Free any previous socket / mbedTLS state before attempting a new connection
+    if (Cfg::MQTT_USE_TLS) {
+        _tlsClient.stop();
+    } else {
+        _plainClient.stop();
+    }
+
     char clientId[40];
     snprintf(clientId, sizeof(clientId), "locker-%llX",
              static_cast<unsigned long long>(ESP.getEfuseMac()));
@@ -82,10 +95,13 @@ void NetworkService::connectMqtt() {
     snprintf(willTopic, sizeof(willTopic), "%sdevice/status", Cfg::MQTT_BASE);
 
     if (!_mqtt.connect(clientId, willTopic, 1, true, "OFFLINE")) {
-        appLog("WARN", "MQTT connect failed: %d", _mqtt.state());
+        appLog("WARN", "MQTT connect failed (%d), retry in %lus",
+               _mqtt.state(), static_cast<unsigned long>(_mqttBackoffMs / 1000));
+        _mqttBackoffMs = min<uint32_t>(_mqttBackoffMs * 2, 30000);
         return;
     }
 
+    _mqttBackoffMs = Cfg::MQTT_RETRY_MS;
     appLog("INFO", "MQTT connected");
     _mqtt.publish(willTopic, "ONLINE", true);
 

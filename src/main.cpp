@@ -266,6 +266,31 @@ static void handleUserSync(const String& message) {
         const bool ok = gLockers.upsertUser(fields[1], fields[2], fields[3], fields[4]);
         appLog("SYNC", "UPSERT %s: %s (total=%u)",
                fields[1].c_str(), ok ? "OK" : "FULL", gLockers.registeredUserCount());
+    } else if (op == "ASSIGN") {
+        if (!verifySignedPacket(message, 7, fields, reason)) {
+            appLog("WARN", "UserSync ASSIGN rejected: %s", reason.c_str());
+            return;
+        }
+        const bool open = fields[3] == "OPEN";
+        const bool ok = (open || fields[3] == "PRESERVE") &&
+            gLockers.assignFromBackend(fields[1], fields[2], open);
+        appLog("SYNC", "ASSIGN %s to %s: %s",
+               fields[2].c_str(), fields[1].c_str(), ok ? "OK" : "REJECTED");
+    } else if (op == "UNASSIGN") {
+        if (!verifySignedPacket(message, 6, fields, reason)) {
+            appLog("WARN", "UserSync UNASSIGN rejected: %s", reason.c_str());
+            return;
+        }
+        const bool ok = gLockers.unassignFromBackend(fields[1], fields[2]);
+        appLog("SYNC", "UNASSIGN %s from %s: %s",
+               fields[2].c_str(), fields[1].c_str(), ok ? "OK" : "REJECTED");
+    } else if (op == "UNASSIGN_ALL") {
+        if (!verifySignedPacket(message, 4, fields, reason)) {
+            appLog("WARN", "UserSync UNASSIGN_ALL rejected: %s", reason.c_str());
+            return;
+        }
+        gLockers.clearAssignments();
+        appLog("SYNC", "UNASSIGN_ALL: OK");
     } else if (op == "RFID_OTP") {
         // Format: RFID_OTP|USER_ID|OTP_CODE|TIMESTAMP|NONCE|SIGNATURE
         if (!verifySignedPacket(message, 6, fields, reason)) {
@@ -420,8 +445,8 @@ static void handleSerial() {
             gLockers.broadcastAllStates("SERIAL_PUSH");
             appLog("SERIAL", "Published all locker states to MQTT");
         } else if (upper == "SYNC_PULL") {
-            const bool ok = gNetwork.publishUserSyncRequest(gLockers.registeredUserCount());
-            appLog("SERIAL", "SYNC_PULL requested -> %s", ok ? "SENT" : "MQTT_OFFLINE");
+            gNetwork.requestUserSync();
+            appLog("SERIAL", "SYNC_PULL queued until local events are sent");
         } else if (upper == "FLUSH_QUEUE") {
             uint8_t flushed = 0;
             String pending;
@@ -485,7 +510,7 @@ static void handleSerial() {
         } else if (upper == "WIFI_RESET") {
             gStorage.clearWifiOverride();
             gNetwork.setWifiCredentials(Cfg::WIFI_SSID, Cfg::WIFI_PASSWORD);
-            appLog("SERIAL", "Wi-Fi reverted to Config.h default (%s)", Cfg::WIFI_SSID);
+            appLog("SERIAL", "Wi-Fi reverted to configured default");
         } else if (upper == "LOGS") {
             printDebugLogs();
         } else if (upper == "CLEAR_LOGS") {
@@ -528,7 +553,7 @@ void setup() {
 
     String savedSsid, savedPass;
     if (gStorage.loadWifiOverride(savedSsid, savedPass)) {
-        appLog("INFO", "Using NVS Wi-Fi override: %s", savedSsid.c_str());
+        appLog("INFO", "Using NVS Wi-Fi override");
         gNetwork.begin(savedSsid.c_str(), savedPass.c_str());
     } else {
         gNetwork.begin();
@@ -564,6 +589,10 @@ void loop() {
         if (gStorage.peek(pending) && gNetwork.publishEvent(pending)) {
             gStorage.pop();
         }
+    }
+    if (gNetwork.mqttConnected() && gNetwork.userSyncPending() &&
+        gStorage.queueCount() == 0) {
+        gNetwork.publishUserSyncRequest(gLockers.registeredUserCount());
     }
 
     static uint32_t lastStateBroadcast = 0;

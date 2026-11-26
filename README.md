@@ -11,9 +11,9 @@ This document serves as the technical handoff and reference guide for developers
 The v2.0 architecture enforces a **single-use locker lifecycle** tied to registered mobile app accounts, combining local offline resilience (NVS storage + internal RTC) with encrypted MQTT synchronization:
 
 1. **Default State:** All compartments default to **Locked (`180°`)** and **Available**.
-2. **Assignment (`A` Key):** Only users registered in the companion app (and synced to the ESP32's local NVS database) can claim a locker. Each `user_id` is limited to **one active locker** at a time. Claiming a locker unlocks it (`0°`) and marks it **Assigned**.
+2. **Backend-Owned Assignment:** A user claims a locker in the web dashboard; the backend is the source of truth and enforces **one active locker per user**. It syncs the signed assignment and credentials to the ESP32. Claiming or extending opens the locker (`0°`); keypad/RFID cannot create assignments locally.
 3. **Auto-Lock on Door Close:** Whenever a reed switch transitions from `OPEN` to `CLOSED`, the servo automatically rotates to `180°` (Locked)—both after initial item drop-off and after item retrieval.
-4. **Single-Use Unlock & Auto-Release (`B` Key):** When an assigned user unlocks their compartment via RFID or PIN, the servo unlocks (`0°`) and the firmware **immediately clears their assignment**, returning the locker to **Available**. Once the user closes the empty door, it relocks automatically (`180°`) for the next user.
+4. **PIN/RFID Access (`B` Key):** PIN/RFID can only open a locker already assigned by the backend. A physical user unlock clears the device-side assignment and reports `LOCKER_UNLOCKED`; the backend moves the account to `EXTENSION_PENDING`. The locker becomes available only after the user chooses Finish or an administrator resolves it.
 5. **Overdue (`>24h`) Hold & Backend Warnings:** Daily reminder notifications (15:00 and 17:00 WIB) are managed by the backend. If a locker remains assigned past **24 hours**, the ESP32 locks the compartment, blocks regular user access (`LOCKER EXPIRED - CONTACT ADMIN`), increments the home screen's `OVERDUE (>24H)` badge, and holds the locker until an operator inspects it and issues a `RELEASE` (via MQTT or local Admin Mode).
 6. **Door-Open Safety Alert:** Leaving any locker door open for more than **60 seconds** triggers a repeating local buzzer alert and emits a `DOOR_OPEN_TIMEOUT` event to the backend.
 
@@ -103,6 +103,14 @@ Follow these hardware rules strictly to prevent voltage spikes, brownouts, and p
 
 ## 5. Firmware Architecture & Build Setup
 
+### 5.0 Local credentials
+
+Copy `include/Secrets.example.h` to `include/Secrets.h` and fill in the
+Wi-Fi credentials, HiveMQ Cloud cluster host and MQTT credentials. Use the
+same HMAC secret as the backend's `SMARTLOCKER_HMAC_SECRET`. `Secrets.h` is
+ignored by Git and must never be committed. TLS certificate verification is
+mandatory; the firmware will not connect if the required settings are blank.
+
 ### 5.1 `platformio.ini` Configuration
 Ensure your `platformio.ini` includes the native USB CDC build flags so firmware uploads and `Serial` logs route through the native `USB` port:
 
@@ -130,7 +138,8 @@ lib_deps =
 
 | File | Responsibility |
 | :--- | :--- |
-| `include/Config.h` | Hardware pinout, Wi-Fi/MQTT credentials, TLS flags, WIB offset (`UTC+7`), admin PIN (`999999`), and app registration URL. |
+| `include/Config.h` | Hardware pinout, TLS settings, WIB offset (`UTC+7`), admin PIN (`999999`), and app registration URL. |
+| `include/Secrets.h` | Ignored local-only Wi-Fi, MQTT broker, and HMAC credentials copied from `include/Secrets.example.h`. |
 | `include/App.h` | Core data structs (`LockerRecord`, `UserRecord`), `ActionStatus` enum, and class declarations. |
 | `src/Hardware.cpp` | Low-level I2C/SPI drivers, keypad matrix scanner, MFRC522 reader, reed switch debouncer, servo PWM, and `128×140` graphic TFT renderer (including `PROGMEM` QR bitmap). |
 | `src/Storage.cpp` | Three NVS namespaces (`lockerdata`, `lockerusers`, `lockersync` FIFO queue) + optional microSD `/locker.log` writer. |
@@ -157,7 +166,7 @@ To update the QR code displayed to unregistered users (`Hardware::drawQrCode`):
 ## 6. Backend Integration & MQTT Specification
 
 ### 6.1 Transport & Cryptographic Security
-* **TLS Encryption:** The ESP32 connects via `WiFiClientSecure` on **port `8883`** (`Cfg::MQTT_USE_TLS = true`). For production brokers with a private CA, paste the PEM Root CA certificate into `Cfg::MQTT_ROOT_CA` in `include/Config.h`.
+* **TLS Encryption:** The ESP32 connects via `WiFiClientSecure` on **port `8883`** (`Cfg::MQTT_USE_TLS = true`) and verifies the broker certificate using `Cfg::MQTT_ROOT_CA` in `include/Config.h`. TLS verification cannot be disabled.
 * **HMAC-SHA256 Payload Authentication:** Every message sent *from* the backend to the ESP32 (`command` and `users/sync`) must be pipe-delimited (`|`) and signed using **HMAC-SHA256** with `Cfg::HMAC_SECRET`:
   * **Canonical String:** All fields except the final signature joined by `|` (e.g., `FIELD_0|FIELD_1|...|TIMESTAMP|NONCE`).
   * **Signature:** 64-character lowercase hexadecimal HMAC-SHA256 digest of the canonical string.
@@ -201,7 +210,22 @@ To update the QR code displayed to unregistered users (`Hardware::drawQrCode`):
    CLEAR|TIMESTAMP|NONCE|SIGNATURE
    ```
 
+   4. **Backend Assignment (7 fields):**
+      ```text
+      ASSIGN|LOCKER_ID|USER_ID|OPEN_OR_PRESERVE|TIMESTAMP|NONCE|SIGNATURE
+      ```
+      * `OPEN_OR_PRESERVE` is `OPEN` for a new claim/extension and `PRESERVE` during reconnect recovery of an occupied locker.
+      * The ESP32 rejects unknown users, conflicting assignments, and a second locker for an already-assigned user.
+
+   5. **Backend Unassignment (6 fields) & Reconnect Reset (4 fields):**
+      ```text
+      UNASSIGN|LOCKER_ID|USER_ID|TIMESTAMP|NONCE|SIGNATURE
+      UNASSIGN_ALL|TIMESTAMP|NONCE|SIGNATURE
+      ```
+      * A device sync request triggers `UNASSIGN_ALL`, followed by credential upserts and current non-pending assignments. The backend omits `EXTENSION_PENDING` ownership from device access until the user extends.
+
 ### 6.4 Required Backend State Synchronization Rules
-* **Immediate Release on `LOCKER_UNLOCKED`:** When the backend receives `event == "LOCKER_UNLOCKED"` on `device/event` (or `assigned: false` on `LOCKER_00X/state`), it must **immediately mark the locker as `AVAILABLE`** in the backend database and notify the user that their rental session has ended.
-* **Scheduled Expiry Warnings (15:00 & 17:00 WIB):** The ESP32 no longer tracks daily warning hours. The backend must run a scheduled job at `15:00` and `17:00` WIB to query active locker rentals and send push/in-app reminders.
-* **Overdue (`>24h`) Resolution:** When `event == "LOCKER_EXPIRED"` is received, flag the compartment as overdue in the admin dashboard. After staff physically inspect and empty the compartment, send a signed `RELEASE` command (or use on-site Admin Mode, which emits `LOCKER_RELEASED`) to return the locker to `AVAILABLE`.
+   * **Cycle Events:** `LOCKER_ASSIGNED` opens the deposit phase; `DOOR_CLOSED_AUTO_LOCKED` marks it occupied; `LOCKER_UNLOCKED` enters `EXTENSION_PENDING` and does not free backend ownership. Only Finish or admin resolution frees the account/locker.
+   * **Device State:** Parse the JSON on `LOCKER_00X/state` and `device/event`. Treat ACKs as `ACCEPTED|LOCKER_ID|CMD_ID|...` or `REJECTED|LOCKER_ID|CMD_ID|REASON`; rejected ACKs must not advance the cycle.
+   * **Reconnect:** The ESP32 flushes queued device events before `users/request`. Then rebuild device credentials and assignments from backend state. Preserve the physical lock state for occupied lockers; never reopen them as part of recovery.
+   * **Overdue (`>24h`) Resolution:** When `event == "LOCKER_EXPIRED"` is received, flag the compartment as overdue in the admin dashboard. Backend ownership remains until staff inspect and resolve it.

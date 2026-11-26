@@ -8,17 +8,16 @@ void NetworkService::begin(const char* ssid, const char* password) {
     _password = password ? password : Cfg::WIFI_PASSWORD;
     _mqttBackoffMs = Cfg::MQTT_RETRY_MS;
 
-    if (Cfg::MQTT_USE_TLS) {
-        if (Cfg::MQTT_ROOT_CA[0] != '\0') {
-            _tlsClient.setCACert(Cfg::MQTT_ROOT_CA);
-        } else {
-            _tlsClient.setInsecure();
-        }
-        _tlsClient.setHandshakeTimeout(5); // Cap TLS handshake at 5s (default is 120s)
-        _mqtt.setClient(_tlsClient);
-    } else {
-        _mqtt.setClient(_plainClient);
+    if (_ssid.isEmpty() || Cfg::MQTT_HOST[0] == '\0' ||
+        Cfg::MQTT_USERNAME[0] == '\0' || Cfg::MQTT_PASSWORD[0] == '\0' ||
+        Cfg::HMAC_SECRET[0] == '\0' || Cfg::MQTT_ROOT_CA[0] == '\0') {
+        Serial.println("[ERROR] Missing Wi-Fi/MQTT/TLS/HMAC secrets; configure include/Secrets.h.");
+        return;
     }
+
+    _tlsClient.setCACert(Cfg::MQTT_ROOT_CA);
+    _tlsClient.setHandshakeTimeout(5);
+    _mqtt.setClient(_tlsClient);
 
     _mqtt.setServer(Cfg::MQTT_HOST, Cfg::MQTT_PORT);
     _mqtt.setCallback(NetworkService::callback);
@@ -65,7 +64,7 @@ void NetworkService::tick() {
         return;
     }
 
-    if (Cfg::MQTT_USE_TLS && Cfg::MQTT_ROOT_CA[0] != '\0' && !gClock.valid()) {
+    if (!gClock.valid()) {
         return;
     }
 
@@ -81,11 +80,7 @@ void NetworkService::tick() {
 
 void NetworkService::connectMqtt() {
     // Free any previous socket / mbedTLS state before attempting a new connection
-    if (Cfg::MQTT_USE_TLS) {
-        _tlsClient.stop();
-    } else {
-        _plainClient.stop();
-    }
+    _tlsClient.stop();
 
     char clientId[40];
     snprintf(clientId, sizeof(clientId), "locker-%llX",
@@ -94,7 +89,8 @@ void NetworkService::connectMqtt() {
     char willTopic[64];
     snprintf(willTopic, sizeof(willTopic), "%sdevice/status", Cfg::MQTT_BASE);
 
-    if (!_mqtt.connect(clientId, willTopic, 1, true, "OFFLINE")) {
+    if (!_mqtt.connect(clientId, Cfg::MQTT_USERNAME, Cfg::MQTT_PASSWORD,
+                       willTopic, 1, true, "OFFLINE")) {
         appLog("WARN", "MQTT connect failed (%d), retry in %lus",
                _mqtt.state(), static_cast<unsigned long>(_mqttBackoffMs / 1000));
         _mqttBackoffMs = min<uint32_t>(_mqttBackoffMs * 2, 30000);
@@ -114,8 +110,7 @@ void NetworkService::connectMqtt() {
     char syncTopic[64];
     snprintf(syncTopic, sizeof(syncTopic), "%susers/sync", Cfg::MQTT_BASE);
     _mqtt.subscribe(syncTopic, 1);
-
-    publishUserSyncRequest(_cachedUserCount);
+    _userSyncPending = true;
 }
 
 void NetworkService::callback(char* topic, byte* payload, unsigned int length) {
@@ -203,7 +198,6 @@ bool NetworkService::publishRfidRegAck(const String& userId, const String& uid,
 }
 
 bool NetworkService::publishUserSyncRequest(uint8_t userCount) {
-    _cachedUserCount = userCount;
     if (!mqttConnected()) return false;
     char topic[64];
     snprintf(topic, sizeof(topic), "%susers/request", Cfg::MQTT_BASE);
@@ -213,7 +207,9 @@ bool NetworkService::publishUserSyncRequest(uint8_t userCount) {
              "{\"device_id\":\"%s\",\"action\":\"SYNC_REQUEST\",\"user_count\":%u}",
              Cfg::DEVICE_ID, userCount);
 
-    return _mqtt.publish(topic, json, false);
+    const bool published = _mqtt.publish(topic, json, false);
+    if (published) _userSyncPending = false;
+    return published;
 }
 
 void NetworkService::setCommandHandler(void (*handler)(const String&)) {

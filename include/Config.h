@@ -2,23 +2,27 @@
 
 #include <Arduino.h>
 
+#if __has_include("Secrets.h")
+#include "Secrets.h"
+#else
+#include "Secrets.example.h"
+#endif
+
 namespace Cfg {
 
 // ============================================================
 // NETWORK & TLS MQTT
 // ============================================================
 
-constexpr char WIFI_SSID[] = "RN10G5C";
-constexpr char WIFI_PASSWORD[] = "ngareplu";
-
 constexpr bool MQTT_USE_TLS = true;
-constexpr char MQTT_HOST[] = "broker.hivemq.com";
+constexpr char MQTT_HOST[] = CfgSecrets::MQTT_HOST;
 constexpr uint16_t MQTT_PORT = 8883;
 constexpr char MQTT_BASE[] = "smartlocker/demo/";
 constexpr char DEVICE_ID[] = "LOCKER_CONTROLLER_001";
+constexpr char MQTT_USERNAME[] = CfgSecrets::MQTT_USERNAME;
+constexpr char MQTT_PASSWORD[] = CfgSecrets::MQTT_PASSWORD;
 
-// Paste your broker's PEM Root CA here for strict certificate verification,
-// or leave empty ("") to use encrypted TLS without CA pinning.
+// The broker's PEM Root CA is required for strict TLS certificate verification.
 constexpr char MQTT_ROOT_CA[] = R"EOF(-----BEGIN CERTIFICATE-----
 MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
 TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
@@ -51,7 +55,9 @@ mRGunUHBcnWEvgJBQl9nJEiU0Zsnvgc/ubhPgXRR4Xq37Z0j4r7g1SgEEzwxA57d
 emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 -----END CERTIFICATE-----)EOF";
 
-constexpr char HMAC_SECRET[] = "smart-locker-demo-secret-key-32";
+constexpr char WIFI_SSID[] = CfgSecrets::WIFI_SSID;
+constexpr char WIFI_PASSWORD[] = CfgSecrets::WIFI_PASSWORD;
+constexpr char HMAC_SECRET[] = CfgSecrets::HMAC_SECRET;
 
 // ============================================================
 // LOCKERS AND 180-DEGREE POSITIONAL SERVOS

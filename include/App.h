@@ -231,6 +231,8 @@ public:
     bool publishRfidRegAck(const String& userId, const String& uid,
                            bool success, const char* reason);
     bool publishUserSyncRequest(uint8_t userCount);
+    void requestUserSync() { _userSyncPending = true; }
+    bool userSyncPending() const { return _userSyncPending; }
 
     void setCommandHandler(void (*handler)(const String&));
     void setUserSyncHandler(void (*handler)(const String&));
@@ -239,7 +241,6 @@ private:
     static void callback(char* topic, byte* payload, unsigned int length);
     void connectMqtt();
 
-    WiFiClient _plainClient;
     WiFiClientSecure _tlsClient;
     PubSubClient _mqtt;
 
@@ -249,7 +250,7 @@ private:
     uint32_t _lastWifiAttempt = 0;
     uint32_t _lastMqttAttempt = 0;
     uint32_t _mqttBackoffMs = Cfg::MQTT_RETRY_MS;
-    uint8_t _cachedUserCount = 0;
+    bool _userSyncPending = false;
 
     static NetworkService* _self;
     void (*_commandHandler)(const String&) = nullptr;
@@ -288,6 +289,9 @@ public:
                     const String& salt, const String& pinHash);
     bool deleteUser(const String& userId);
     void clearUsers();
+    bool assignFromBackend(const String& lockerId, const String& userId, bool open);
+    bool unassignFromBackend(const String& lockerId, const String& userId);
+    void clearAssignments();
     uint8_t registeredUserCount() const;
     void listUsersToSerial(Stream& out) const;
 
@@ -318,7 +322,6 @@ private:
     int findAssignedLockerByUid(const String& uid) const;
     int findAssignedLockerByPin(const String& pin) const;
 
-    ActionStatus assignToUser(int userIdx, const char* method, String& lockerName);
     ActionStatus releaseUnlockedLocker(int lockerIdx, const char* method, String& lockerName);
 
     void saveLocker(uint8_t index);

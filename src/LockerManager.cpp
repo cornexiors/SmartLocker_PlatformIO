@@ -231,58 +231,16 @@ int LockerManager::findAssignedLockerByPin(const String& pin) const {
 // ASSIGN & SINGLE-USE UNLOCK-RELEASE FLOWS
 // ============================================================
 
-ActionStatus LockerManager::assignToUser(int userIdx, const char* method, String& lockerName) {
-    if (userIdx < 0 || userIdx >= Cfg::MAX_USERS || !_users[userIdx].active) {
-        return ActionStatus::UNAUTHORIZED;
-    }
-
-    const UserRecord& u = _users[userIdx];
-
-    const int existing = findAssignedLockerByUserId(u.userId);
-    if (existing >= 0) {
-        lockerName = Cfg::LOCKER_IDS[existing];
-        return ActionStatus::ALREADY_ASSIGNED;
-    }
-
-    for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
-        if (isAssigned(_records[i])) continue;
-
-        LockerRecord r{};
-        r.flags = 0x01;
-        strlcpy(r.userId, u.userId, sizeof(r.userId));
-        strlcpy(r.uid, u.uid, sizeof(r.uid));
-        strlcpy(r.salt, u.salt, sizeof(r.salt));
-        strlcpy(r.pinHash, u.pinHash, sizeof(r.pinHash));
-        r.assignedAt = _clock->nowUtc();
-        r.expiresAt = _clock->valid() ? (r.assignedAt + Cfg::RENTAL_SECONDS) : 0;
-
-        _records[i] = r;
-        saveLocker(i);
-
-        if (!setLock(i, false, method)) {
-            _records[i] = LockerRecord{};
-            saveLocker(i);
-            return ActionStatus::HARDWARE_ERROR;
-        }
-
-        emitEvent("LOCKER_ASSIGNED", i, method, u.userId);
-        lockerName = Cfg::LOCKER_IDS[i];
-        return ActionStatus::OK;
-    }
-
-    return ActionStatus::NO_LOCKER_FREE;
-}
-
 ActionStatus LockerManager::assignByUid(const String& uid, String& lockerName) {
-    const int userIdx = findRegisteredUserByUid(uid);
-    if (userIdx < 0) return ActionStatus::UNAUTHORIZED;
-    return assignToUser(userIdx, "RFID", lockerName);
+    (void)uid;
+    (void)lockerName;
+    return ActionStatus::UNAUTHORIZED;
 }
 
 ActionStatus LockerManager::assignByPin(const String& pin, String& lockerName) {
-    const int userIdx = findRegisteredUserByPin(pin);
-    if (userIdx < 0) return ActionStatus::UNAUTHORIZED;
-    return assignToUser(userIdx, "PIN", lockerName);
+    (void)pin;
+    (void)lockerName;
+    return ActionStatus::UNAUTHORIZED;
 }
 
 ActionStatus LockerManager::releaseUnlockedLocker(int lockerIdx, const char* method, String& lockerName) {
@@ -513,6 +471,70 @@ bool LockerManager::upsertUser(const String& userId, const String& uid,
         saveLocker(lockerIdx);
     }
     return true;
+}
+
+bool LockerManager::assignFromBackend(const String& lockerId, const String& userId, bool open) {
+    const int lockerIdx = findLockerId(lockerId);
+    if (lockerIdx < 0 || userId.isEmpty()) return false;
+
+    const int existingLocker = findAssignedLockerByUserId(userId);
+    if (existingLocker >= 0) {
+        return existingLocker == lockerIdx;
+    }
+    if (isAssigned(_records[lockerIdx])) return false;
+
+    int userIdx = -1;
+    for (uint8_t i = 0; i < Cfg::MAX_USERS; ++i) {
+        if (_users[i].active && userId.equalsIgnoreCase(_users[i].userId)) {
+            userIdx = i;
+            break;
+        }
+    }
+    if (userIdx < 0) return false;
+
+    const UserRecord& user = _users[userIdx];
+    LockerRecord record{};
+    record.flags = 0x01;
+    strlcpy(record.userId, user.userId, sizeof(record.userId));
+    strlcpy(record.uid, user.uid, sizeof(record.uid));
+    strlcpy(record.salt, user.salt, sizeof(record.salt));
+    strlcpy(record.pinHash, user.pinHash, sizeof(record.pinHash));
+    record.assignedAt = _clock->nowUtc();
+    record.expiresAt = _clock->valid()
+        ? record.assignedAt + Cfg::RENTAL_SECONDS
+        : 0;
+
+    _records[lockerIdx] = record;
+    saveLocker(lockerIdx);
+    if (open && !setLock(lockerIdx, false, "BACKEND_ASSIGN")) {
+        _records[lockerIdx] = LockerRecord{};
+        saveLocker(lockerIdx);
+        return false;
+    }
+
+    emitEvent("LOCKER_ASSIGNED", lockerIdx, "BACKEND", user.userId);
+    return true;
+}
+
+bool LockerManager::unassignFromBackend(const String& lockerId, const String& userId) {
+    const int lockerIdx = findLockerId(lockerId);
+    if (lockerIdx < 0 || userId.isEmpty()) return false;
+    if (!isAssigned(_records[lockerIdx])) return true;
+    if (!userId.equalsIgnoreCase(_records[lockerIdx].userId)) return false;
+
+    _records[lockerIdx] = LockerRecord{};
+    saveLocker(lockerIdx);
+    publishFullLockerState(lockerIdx, "BACKEND_UNASSIGN");
+    return true;
+}
+
+void LockerManager::clearAssignments() {
+    for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
+        if (!isAssigned(_records[i])) continue;
+        _records[i] = LockerRecord{};
+        saveLocker(i);
+    }
+    broadcastAllStates("BACKEND_SYNC");
 }
 
 bool LockerManager::deleteUser(const String& userId) {

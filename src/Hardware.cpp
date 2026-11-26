@@ -375,7 +375,7 @@ void Hardware::drawHome(bool wifiOk, bool mqttOk, const char* shortTime,
     _tft.setTextSize(1);
     _tft.setTextColor(ST77XX_BLACK);
     _tft.setCursor(9, btnY + 7);
-    _tft.print(F("A:Assign"));
+    _tft.print(F("A:App"));
 
     _tft.fillRoundRect(66, btnY, 58, 22, 4, COLOR_OK);
     _tft.setTextColor(ST77XX_BLACK);

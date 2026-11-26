@@ -177,8 +177,7 @@ void UserInterface::onKey(char key) {
     // HOME SCREEN
     if (_state == HOME) {
         if (key == 'A') {
-            _state = ASSIGN_ASK;
-            refreshCurrentScreen();
+            showResult("CLAIM IN APP", "Use dashboard", false);
         } else if (key == 'B') {
             _pin = "";
             _state = UNLOCK_CRED;
@@ -284,8 +283,8 @@ void UserInterface::onKey(char key) {
                 refreshCurrentScreen();
             }
         } else if (key == 'A') {
-            _net->publishUserSyncRequest(_lockers->registeredUserCount());
-            showResult("SYNC REQUESTED", "Pulling users...", false);
+            _net->requestUserSync();
+            showResult("SYNC REQUESTED", "Sending local events first", false);
         }
     }
 }

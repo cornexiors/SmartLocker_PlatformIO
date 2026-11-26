@@ -1,0 +1,25 @@
+{
+  "name": "smartlocker-backend",
+  "version": "1.0.0",
+  "description": "Smart Locker backend (Node.js port of the FastAPI version)",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "type": "module",
+  "dependencies": {
+    "better-sqlite3": "^13.0.3",
+    "cors": "^2.8.6",
+    "express": "^5.3.0",
+    "mqtt": "^5.16.1",
+    "swagger-ui-express": "^5.0.1"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "allowScripts": {
+    "better-sqlite3@13.0.3": true
+  }
+}

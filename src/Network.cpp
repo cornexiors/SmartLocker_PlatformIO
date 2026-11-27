@@ -4,21 +4,23 @@ NetworkService* NetworkService::_self = nullptr;
 
 void NetworkService::begin(const char* ssid, const char* password) {
     _self = this;
+    _netMutex = xSemaphoreCreateMutex();
+    _inQueue = xQueueCreate(12, sizeof(MqttInMsg));
+
     _ssid = ssid ? ssid : Cfg::WIFI_SSID;
     _password = password ? password : Cfg::WIFI_PASSWORD;
     _mqttBackoffMs = Cfg::MQTT_RETRY_MS;
 
-    if (Cfg::MQTT_USE_TLS) {
-        if (Cfg::MQTT_ROOT_CA[0] != '\0') {
-            _tlsClient.setCACert(Cfg::MQTT_ROOT_CA);
-        } else {
-            _tlsClient.setInsecure();
-        }
-        _tlsClient.setHandshakeTimeout(5); // Cap TLS handshake at 5s (default is 120s)
-        _mqtt.setClient(_tlsClient);
-    } else {
-        _mqtt.setClient(_plainClient);
+    if (_ssid.isEmpty() || Cfg::MQTT_HOST[0] == '\0' ||
+        Cfg::MQTT_USERNAME[0] == '\0' || Cfg::MQTT_PASSWORD[0] == '\0' ||
+        Cfg::HMAC_SECRET[0] == '\0' || Cfg::MQTT_ROOT_CA[0] == '\0') {
+        appLog("ERROR", "Missing Wi-Fi/MQTT/TLS/HMAC secrets in Secrets.h");
+        return;
     }
+
+    _tlsClient.setCACert(Cfg::MQTT_ROOT_CA);
+    _tlsClient.setHandshakeTimeout(5);
+    _mqtt.setClient(_tlsClient);
 
     _mqtt.setServer(Cfg::MQTT_HOST, Cfg::MQTT_PORT);
     _mqtt.setCallback(NetworkService::callback);
@@ -27,20 +29,24 @@ void NetworkService::begin(const char* ssid, const char* password) {
     _mqtt.setKeepAlive(20);
 
     WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
     WiFi.begin(_ssid.c_str(), _password.c_str());
     _lastWifiAttempt = millis();
 }
 
 void NetworkService::setWifiCredentials(const String& ssid, const String& password) {
+    xSemaphoreTake(_netMutex, portMAX_DELAY);
     _ssid = ssid;
     _password = password;
-    if (_mqtt.connected()) {
-        _mqtt.disconnect();
-    }
-    WiFi.disconnect(true);
-    delay(100);
-    WiFi.begin(_ssid.c_str(), _password.c_str());
-    _lastWifiAttempt = millis();
+    _wifiCredsDirty = true;
+    xSemaphoreGive(_netMutex);
+}
+
+String NetworkService::currentSsid() const {
+    xSemaphoreTake(_netMutex, portMAX_DELAY);
+    String copy = _ssid;
+    xSemaphoreGive(_netMutex);
+    return copy;
 }
 
 bool NetworkService::wifiConnected() const {
@@ -48,7 +54,11 @@ bool NetworkService::wifiConnected() const {
 }
 
 bool NetworkService::mqttConnected() {
-    return wifiConnected() && _mqtt.connected();
+    if (!wifiConnected()) return false;
+    xSemaphoreTake(_netMutex, portMAX_DELAY);
+    const bool conn = _mqtt.connected();
+    xSemaphoreGive(_netMutex);
+    return conn;
 }
 
 bool NetworkService::online() {
@@ -57,18 +67,36 @@ bool NetworkService::online() {
 
 void NetworkService::tick() {
     const uint32_t now = millis();
+
+    xSemaphoreTake(_netMutex, portMAX_DELAY);
+    if (_wifiCredsDirty) {
+        _wifiCredsDirty = false;
+        if (_mqtt.connected()) _mqtt.disconnect();
+        WiFi.disconnect(true);
+        vTaskDelay(pdMS_TO_TICKS(50));
+        WiFi.begin(_ssid.c_str(), _password.c_str());
+        _lastWifiAttempt = now;
+        xSemaphoreGive(_netMutex);
+        return;
+    }
+    const String ssidCopy = _ssid;
+    const String passCopy = _password;
+    xSemaphoreGive(_netMutex);
+
     if (!wifiConnected()) {
         if (now - _lastWifiAttempt >= Cfg::WIFI_RETRY_MS) {
             _lastWifiAttempt = now;
-            WiFi.begin(_ssid.c_str(), _password.c_str());
+            WiFi.begin(ssidCopy.c_str(), passCopy.c_str());
         }
         return;
     }
 
-    if (Cfg::MQTT_USE_TLS && Cfg::MQTT_ROOT_CA[0] != '\0' && !gClock.valid()) {
+    // Gate TLS handshake until SNTP has set valid epoch for X.509 certificate verification
+    if (!gClock.valid()) {
         return;
     }
 
+    xSemaphoreTake(_netMutex, portMAX_DELAY);
     if (!_mqtt.connected()) {
         if (now - _lastMqttAttempt >= _mqttBackoffMs) {
             _lastMqttAttempt = now;
@@ -77,24 +105,21 @@ void NetworkService::tick() {
     } else {
         _mqtt.loop();
     }
+    xSemaphoreGive(_netMutex);
 }
 
 void NetworkService::connectMqtt() {
-    // Free any previous socket / mbedTLS state before attempting a new connection
-    if (Cfg::MQTT_USE_TLS) {
-        _tlsClient.stop();
-    } else {
-        _plainClient.stop();
-    }
+    _tlsClient.stop();
 
-    char clientId[40];
-    snprintf(clientId, sizeof(clientId), "locker-%llX",
-             static_cast<unsigned long long>(ESP.getEfuseMac()));
+    char clientId[48];
+    snprintf(clientId, sizeof(clientId), "%s-%llX",
+             Cfg::DEVICE_ID, static_cast<unsigned long long>(ESP.getEfuseMac()));
 
     char willTopic[64];
     snprintf(willTopic, sizeof(willTopic), "%sdevice/status", Cfg::MQTT_BASE);
 
-    if (!_mqtt.connect(clientId, willTopic, 1, true, "OFFLINE")) {
+    if (!_mqtt.connect(clientId, Cfg::MQTT_USERNAME, Cfg::MQTT_PASSWORD,
+                       willTopic, 1, true, "OFFLINE")) {
         appLog("WARN", "MQTT connect failed (%d), retry in %lus",
                _mqtt.state(), static_cast<unsigned long>(_mqttBackoffMs / 1000));
         _mqttBackoffMs = min<uint32_t>(_mqttBackoffMs * 2, 30000);
@@ -102,7 +127,7 @@ void NetworkService::connectMqtt() {
     }
 
     _mqttBackoffMs = Cfg::MQTT_RETRY_MS;
-    appLog("INFO", "MQTT connected");
+    appLog("INFO", "TLS MQTT connected (%s)", Cfg::LOCATION_ID);
     _mqtt.publish(willTopic, "ONLINE", true);
 
     for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
@@ -114,112 +139,119 @@ void NetworkService::connectMqtt() {
     char syncTopic[64];
     snprintf(syncTopic, sizeof(syncTopic), "%susers/sync", Cfg::MQTT_BASE);
     _mqtt.subscribe(syncTopic, 1);
-
-    publishUserSyncRequest(_cachedUserCount);
+    _userSyncPending = true;
 }
 
 void NetworkService::callback(char* topic, byte* payload, unsigned int length) {
-    if (!_self || length == 0 || length >= Cfg::MQTT_BUFFER_SIZE) return;
+    if (!_self || !_self->_inQueue || length == 0 || length >= Cfg::MQTT_BUFFER_SIZE) return;
 
-    String message;
-    message.reserve(length);
-    for (unsigned int i = 0; i < length; ++i) {
-        message += static_cast<char>(payload[i]);
-    }
+    MqttInMsg msg{};
+    strncpy(msg.topic, topic, sizeof(msg.topic) - 1);
+    memcpy(msg.payload, payload, length);
+    msg.payload[length] = '\0';
 
-    char syncTopic[64];
-    snprintf(syncTopic, sizeof(syncTopic), "%susers/sync", Cfg::MQTT_BASE);
-    if (strcmp(topic, syncTopic) == 0) {
-        if (_self->_userSyncHandler) _self->_userSyncHandler(message);
-        return;
-    }
+    xQueueSend(_self->_inQueue, &msg, 0);
+}
 
-    const int sep = message.indexOf('|');
-    if (sep <= 0) return;
-
-    String lockerId = message.substring(0, sep);
-    lockerId.trim();
-    lockerId.toUpperCase();
-
-    for (uint8_t i = 0; i < Cfg::LOCKER_COUNT; ++i) {
-        char expected[64];
-        snprintf(expected, sizeof(expected), "%s%s/command", Cfg::MQTT_BASE, Cfg::LOCKER_IDS[i]);
-        if (lockerId == Cfg::LOCKER_IDS[i] && strcmp(topic, expected) == 0) {
-            if (_self->_commandHandler) _self->_commandHandler(message);
-            return;
-        }
-    }
+bool NetworkService::dequeueIncomingMqtt(MqttInMsg& out) {
+    if (!_inQueue) return false;
+    return xQueueReceive(_inQueue, &out, 0) == pdTRUE;
 }
 
 bool NetworkService::publishEvent(const String& payload) {
-    if (!mqttConnected()) return false;
-    char topic[64];
-    snprintf(topic, sizeof(topic), "%sdevice/event", Cfg::MQTT_BASE);
-    return _mqtt.publish(topic, payload.c_str(), false);
+    if (!wifiConnected()) return false;
+    xSemaphoreTake(_netMutex, portMAX_DELAY);
+    bool ok = false;
+    if (_mqtt.connected()) {
+        char topic[64];
+        snprintf(topic, sizeof(topic), "%sdevice/event", Cfg::MQTT_BASE);
+        ok = _mqtt.publish(topic, payload.c_str(), false);
+    }
+    xSemaphoreGive(_netMutex);
+    return ok;
 }
 
 bool NetworkService::publishLockerState(uint8_t index, bool locked, bool assigned,
                                         bool expired, const char* userId, const char* method) {
-    if (!mqttConnected() || index >= Cfg::LOCKER_COUNT) return false;
-    char topic[64];
-    snprintf(topic, sizeof(topic), "%s%s/state", Cfg::MQTT_BASE, Cfg::LOCKER_IDS[index]);
+    if (!wifiConnected() || index >= Cfg::LOCKER_COUNT) return false;
+    xSemaphoreTake(_netMutex, portMAX_DELAY);
+    bool ok = false;
+    if (_mqtt.connected()) {
+        char topic[64];
+        snprintf(topic, sizeof(topic), "%s%s/state", Cfg::MQTT_BASE, Cfg::LOCKER_IDS[index]);
 
-    char json[220];
-    snprintf(json, sizeof(json),
-             "{\"locker_id\":\"%s\",\"locked\":%s,\"assigned\":%s,\"expired\":%s,"
-             "\"user_id\":\"%s\",\"method\":\"%s\"}",
-             Cfg::LOCKER_IDS[index],
-             locked ? "true" : "false",
-             assigned ? "true" : "false",
-             expired ? "true" : "false",
-             userId ? userId : "",
-             method ? method : "SYSTEM");
+        char json[260];
+        snprintf(json, sizeof(json),
+                 "{\"location_id\":\"%s\",\"device_id\":\"%s\",\"locker_id\":\"%s\","
+                 "\"locked\":%s,\"assigned\":%s,\"expired\":%s,"
+                 "\"user_id\":\"%s\",\"method\":\"%s\"}",
+                 Cfg::LOCATION_ID,
+                 Cfg::DEVICE_ID,
+                 Cfg::LOCKER_IDS[index],
+                 locked ? "true" : "false",
+                 assigned ? "true" : "false",
+                 expired ? "true" : "false",
+                 userId ? userId : "",
+                 method ? method : "SYSTEM");
 
-    return _mqtt.publish(topic, json, true);
+        ok = _mqtt.publish(topic, json, true);
+    }
+    xSemaphoreGive(_netMutex);
+    return ok;
 }
 
 bool NetworkService::publishAck(uint8_t index, const String& payload) {
-    if (!mqttConnected() || index >= Cfg::LOCKER_COUNT) return false;
-    char topic[64];
-    snprintf(topic, sizeof(topic), "%s%s/ack", Cfg::MQTT_BASE, Cfg::LOCKER_IDS[index]);
-    return _mqtt.publish(topic, payload.c_str(), false);
+    if (!wifiConnected() || index >= Cfg::LOCKER_COUNT) return false;
+    xSemaphoreTake(_netMutex, portMAX_DELAY);
+    bool ok = false;
+    if (_mqtt.connected()) {
+        char topic[64];
+        snprintf(topic, sizeof(topic), "%s%s/ack", Cfg::MQTT_BASE, Cfg::LOCKER_IDS[index]);
+        ok = _mqtt.publish(topic, payload.c_str(), false);
+    }
+    xSemaphoreGive(_netMutex);
+    return ok;
 }
 
 bool NetworkService::publishRfidRegAck(const String& userId, const String& uid,
                                        bool success, const char* reason) {
-    if (!mqttConnected()) return false;
-    char topic[64];
-    snprintf(topic, sizeof(topic), "%susers/ack", Cfg::MQTT_BASE);
+    if (!wifiConnected()) return false;
+    xSemaphoreTake(_netMutex, portMAX_DELAY);
+    bool ok = false;
+    if (_mqtt.connected()) {
+        char topic[64];
+        snprintf(topic, sizeof(topic), "%susers/ack", Cfg::MQTT_BASE);
 
-    char payload[128];
-    snprintf(payload, sizeof(payload),
-             "RFID_REG_ACK|%s|%s|%s|%s",
-             userId.c_str(),
-             uid.c_str(),
-             success ? "ACCEPTED" : "REJECTED",
-             reason ? reason : "");
+        char payload[128];
+        snprintf(payload, sizeof(payload),
+                 "RFID_REG_ACK|%s|%s|%s|%s",
+                 userId.c_str(),
+                 uid.c_str(),
+                 success ? "ACCEPTED" : "REJECTED",
+                 reason ? reason : "");
 
-    return _mqtt.publish(topic, payload, false);
+        ok = _mqtt.publish(topic, payload, false);
+    }
+    xSemaphoreGive(_netMutex);
+    return ok;
 }
 
 bool NetworkService::publishUserSyncRequest(uint8_t userCount) {
-    _cachedUserCount = userCount;
-    if (!mqttConnected()) return false;
-    char topic[64];
-    snprintf(topic, sizeof(topic), "%susers/request", Cfg::MQTT_BASE);
+    if (!wifiConnected()) return false;
+    xSemaphoreTake(_netMutex, portMAX_DELAY);
+    bool published = false;
+    if (_mqtt.connected()) {
+        char topic[64];
+        snprintf(topic, sizeof(topic), "%susers/request", Cfg::MQTT_BASE);
 
-    char json[128];
-    snprintf(json, sizeof(json),
-             "{\"device_id\":\"%s\",\"action\":\"SYNC_REQUEST\",\"user_count\":%u}",
-             Cfg::DEVICE_ID, userCount);
+        char json[160];
+        snprintf(json, sizeof(json),
+                 "{\"location_id\":\"%s\",\"device_id\":\"%s\",\"action\":\"SYNC_REQUEST\",\"user_count\":%u}",
+                 Cfg::LOCATION_ID, Cfg::DEVICE_ID, userCount);
 
-    return _mqtt.publish(topic, json, false);
-}
-
-void NetworkService::setCommandHandler(void (*handler)(const String&)) {
-    _commandHandler = handler;
-}
-
-void NetworkService::setUserSyncHandler(void (*handler)(const String&)) {
-    _userSyncHandler = handler;
+        published = _mqtt.publish(topic, json, false);
+        if (published) _userSyncPending = false;
+    }
+    xSemaphoreGive(_netMutex);
+    return published;
 }

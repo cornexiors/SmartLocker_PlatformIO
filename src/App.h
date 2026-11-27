@@ -9,21 +9,25 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <SD.h>
-#include <RTClib.h>
+#include <LittleFS.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
 #include <MFRC522v2.h>
 #include <MFRC522DriverSPI.h>
 #include <MFRC522DriverPinSimple.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/queue.h>
+#include <freertos/semphr.h>
 
 #include "Config.h"
 
 // ============================================================
-// DATA STRUCTURES
+// DOMAIN DATA STRUCTURES
 // ============================================================
 
 struct LockerRecord {
-    uint8_t flags = 0;         // 0x01 = ASSIGNED, 0x02 = EXPIRED_HOLD (>24h)
+    uint8_t flags = 0;         // 0x01 = ASSIGNED, 0x02 = EXPIRED_HOLD
     char userId[25] = {};
     char uid[21] = {};
     char salt[17] = {};
@@ -48,17 +52,90 @@ struct UserRecord {
     char pinHash[65] = {};
 };
 
+struct AdminConfig {
+    uint8_t provisioned = 0;
+    char buildSig[32] = {};
+    char rfidUid[21] = {};
+    char pinSalt[17] = {};
+    char pinHash[65] = {};
+};
+
 enum class ActionStatus : uint8_t {
     OK = 0,
     UNAUTHORIZED,
     EXPIRED,
     ALREADY_ASSIGNED,
     NO_LOCKER_FREE,
+    OFFLINE_BLOCKED,
     HARDWARE_ERROR
 };
 
+enum class RgbState : uint8_t {
+    ONLINE_IDLE = 0,   // Green
+    MQTT_CONNECTING,   // Blue
+    OFFLINE_LOCAL,     // Amber
+    ACTIVE_SESSION,    // Cyan
+    ADMIN_ACTIVE,      // Purple
+    ALERT_ERROR        // Red
+};
+
 // ============================================================
-// STORAGE
+// INTER-CORE FREERTOS IPC MESSAGES
+// ============================================================
+
+enum class AuthRequestType : uint8_t {
+    USER_ASSIGN_PIN = 0,
+    USER_UNLOCK_PIN,
+    ADMIN_SERIAL_LOGIN,
+    ADMIN_DMENU_PIN
+};
+
+struct AuthRequest {
+    uint32_t requestId = 0;
+    AuthRequestType type = AuthRequestType::USER_ASSIGN_PIN;
+    int8_t lockerIndex = -1;
+    char username[32] = {};
+    char pin[12] = {};
+};
+
+struct AuthResult {
+    uint32_t requestId = 0;
+    AuthRequestType type = AuthRequestType::USER_ASSIGN_PIN;
+    bool matched = false;
+    int8_t lockerIndex = -1;
+    int16_t userSlot = -1;
+    char userId[25] = {};
+};
+
+struct MqttInMsg {
+    char topic[72] = {};
+    char payload[Cfg::MQTT_BUFFER_SIZE] = {};
+};
+
+// ============================================================
+// SECURITY & CRYPTOGRAPHY (SHARED PURE-COMPUTE + REPLAY GUARD)
+// ============================================================
+
+namespace Security {
+    String generateSaltHex();
+    String makePinHash(const char* salt, const String& pin);
+    bool verifyPinHash(const char* salt, const String& pin, const char* expectedHash);
+    bool secureEqual(const String& a, const String& b);
+    String hmacSha256(const String& message);
+
+    bool verifySignedPacket(const String& packet, uint8_t expectedFields,
+                            String* outFields, String& errorReason,
+                            bool checkTimestamp, uint64_t nowUtc);
+
+    int findCachedCommand(const String& lockerId, const String& commandId);
+    String getCachedCommandAck(int cacheIndex);
+    void cacheCommand(const String& lockerId, const String& commandId, const String& ack);
+
+    bool verifySerialAdmin(const String& username, const String& password);
+}
+
+// ============================================================
+// MUTEX-PROTECTED STORAGE (NVS + LITTLEFS + SD)
 // ============================================================
 
 class Storage {
@@ -72,6 +149,10 @@ public:
     void saveUser(uint8_t slot, const UserRecord& user);
     void clearAllUsers();
 
+    void loadAdminConfig(AdminConfig& cfg);
+    void saveAdminConfig(const AdminConfig& cfg);
+    void clearAdminConfig();
+
     bool enqueue(const String& payload);
     bool peek(String& payload);
     void pop();
@@ -81,24 +162,30 @@ public:
     bool loadWifiOverride(String& ssid, String& password);
     void clearWifiOverride();
 
+    void factoryResetAll();
+
     bool sdReady() const { return _sdReady; }
+    bool fsReady() const { return _fsReady; }
     void logEvent(const String& payload);
-    void dumpSdLog(Stream& out);
-    void clearSdLog();
+    void dumpLogs(Stream& out);
+    void clearLogs();
 
 private:
+    SemaphoreHandle_t _mutex = nullptr;
     Preferences _prefs;
     Preferences _users;
     Preferences _queue;
     Preferences _netCfg;
+    Preferences _adminPrefs;
 
     bool _sdReady = false;
+    bool _fsReady = false;
     uint8_t _head = 0;
     uint8_t _tail = 0;
 };
 
 // ============================================================
-// CLOCK SERVICE
+// CLOCK SERVICE (CORE 0 SNTP + INTERNAL ESP32-S3 RTC)
 // ============================================================
 
 class ClockService {
@@ -108,26 +195,18 @@ public:
 
     bool valid() const;
     uint64_t nowUtc() const;
-
     void forceNtpSync();
 
     void formatLocal(char* out, size_t length) const;
     void formatShortLocal(char* out, size_t length) const;
 
-    bool externalRtcReady() const { return _extRtcReady; }
-
 private:
-    void setSystemEpoch(uint64_t epoch);
-
-    mutable RTC_DS1307 _rtc;
-    bool _extRtcReady = false;
     bool _ntpStarted = false;
-    uint32_t _lastRtcProbe = 0;
     uint32_t _lastNtpSyncMs = 0;
 };
 
 // ============================================================
-// HARDWARE & GRAPHIC UI DRIVER
+// HARDWARE & ST7735 GRAPHIC DRIVER (CORE 1)
 // ============================================================
 
 class Hardware {
@@ -141,44 +220,66 @@ public:
     bool doorChanged(uint8_t index, bool& closed);
 
     bool setLockerActuator(uint8_t index, bool locked);
-    bool setExpansionOutput(uint8_t bit, bool high);
+    bool setServoAngleDirect(uint8_t index, int angle);
 
-    void setLed(bool on);
+    void setOnlineLed(bool on);
+    void setRgbState(RgbState state);
+    void testRgbCycle();
     void beep(uint16_t durationMs = 60);
 
     // Graphic TFT UI (128x140)
     void drawTopBar(bool wifiOk, bool mqttOk, const char* shortTime);
+    void updateTopClock(bool wifiOk, bool mqttOk, const char* shortTime);
+    void drawCountdownBadge(uint16_t secondsLeft, uint16_t totalSeconds);
+
     void drawHome(bool wifiOk, bool mqttOk, const char* shortTime,
                   uint8_t available, uint8_t problematic);
-    void updateHomeClock(bool wifiOk, bool mqttOk, const char* shortTime);
 
-    void drawRegisterPrompt(bool wifiOk, bool mqttOk, const char* shortTime);
-    void drawQrCode(bool wifiOk, bool mqttOk, const char* shortTime, const char* url);
+    void drawQrRegister(bool wifiOk, bool mqttOk, const char* shortTime,
+                        const char* url, const char* subtitle, uint16_t secLeft);
 
     void drawCredentialPrompt(bool wifiOk, bool mqttOk, const char* shortTime,
-                              bool assigning, uint8_t pinLength);
-    void updateCredentialPin(uint8_t pinLength);
+                              const char* header, const char* hint,
+                              uint8_t pinLength, uint16_t secLeft);
+    void updatePinBoxes(uint8_t pinLength);
 
-    void drawOtpPrompt(bool wifiOk, bool mqttOk, const char* shortTime, uint8_t pinLength);
-    void drawOtpTapRfid(bool wifiOk, bool mqttOk, const char* shortTime, const char* userId);
+    void drawLockerSelector(bool wifiOk, bool mqttOk, const char* shortTime,
+                            const LockerRecord records[Cfg::LOCKER_COUNT],
+                            const bool locked[Cfg::LOCKER_COUNT],
+                            uint8_t selectedIndex, uint16_t secLeft);
+
+    void drawUnlockActionPrompt(bool wifiOk, bool mqttOk, const char* shortTime,
+                                uint8_t lockerIndex, uint16_t secLeft);
+
+    void drawDMenuFirstPage(bool wifiOk, bool mqttOk, const char* shortTime,
+                            const char* url, uint8_t pinLength, uint16_t secLeft);
+
+    void drawTapCardPrompt(bool wifiOk, bool mqttOk, const char* shortTime,
+                           const char* title, const char* subtitle, uint16_t secLeft);
 
     void drawResult(bool wifiOk, bool mqttOk, const char* shortTime,
-                    const String& title, const String& detail, bool isError);
+                    const String& title, const String& detail,
+                    bool isError, uint16_t secLeft);
 
     void drawAdminMenu(bool wifiOk, bool mqttOk, const char* shortTime,
                        const LockerRecord records[Cfg::LOCKER_COUNT],
                        const bool locked[Cfg::LOCKER_COUNT],
-                       uint8_t userCount);
+                       uint8_t userCount, uint16_t secLeft);
+
+    void drawAdminTargetPrompt(bool wifiOk, bool mqttOk, const char* shortTime,
+                               const char* title, const char* prompt,
+                               const String& value, uint16_t secLeft);
 
     bool displayReady() const { return _displayReady; }
     bool keypadReady() const { return _pcfReady; }
     bool rfidReady() const { return _rfidReady; }
+    uint8_t rfidVersionReg();
 
 private:
-    bool pcfWrite(uint16_t value);
+    bool pcfWrite(uint16_t mask);
     bool pcfRead(uint16_t& value);
     void drawConnectivityIcon(int16_t x, int16_t y, bool wifiOk, bool mqttOk);
-    void drawPinUnderlineBoxes(uint8_t pinLength);
+    void drawQrMatrix(int16_t x0, int16_t y0, uint8_t scale, const char* url);
 
     bool _i2cReady = false;
     bool _pcfReady = false;
@@ -186,8 +287,9 @@ private:
     bool _rfidReady = false;
 
     uint8_t _pcfAddress = Cfg::PCF8575_ADDRESS;
-    uint16_t _pcfOutputState = 0xFF00;
+    uint16_t _pcfLastWord = 0xFFFF;
     uint32_t _lastRfidMs = 0;
+    RgbState _lastRgb = RgbState::OFFLINE_LOCAL;
 
     bool _doorRaw[Cfg::LOCKER_COUNT] = {};
     bool _doorStable[Cfg::LOCKER_COUNT] = {};
@@ -208,7 +310,7 @@ private:
 };
 
 // ============================================================
-// NETWORK SERVICE
+// NETWORK & CRYPTO WORKER SERVICE (CORE 0)
 // ============================================================
 
 class NetworkService {
@@ -216,7 +318,7 @@ public:
     void begin(const char* ssid = Cfg::WIFI_SSID,
                const char* password = Cfg::WIFI_PASSWORD);
     void setWifiCredentials(const String& ssid, const String& password);
-    String currentSsid() const { return _ssid; }
+    String currentSsid() const;
 
     void tick();
 
@@ -231,33 +333,35 @@ public:
     bool publishRfidRegAck(const String& userId, const String& uid,
                            bool success, const char* reason);
     bool publishUserSyncRequest(uint8_t userCount);
+    void requestUserSync() { _userSyncPending = true; }
+    bool userSyncPending() const { return _userSyncPending; }
 
-    void setCommandHandler(void (*handler)(const String&));
-    void setUserSyncHandler(void (*handler)(const String&));
+    bool dequeueIncomingMqtt(MqttInMsg& out);
 
 private:
     static void callback(char* topic, byte* payload, unsigned int length);
     void connectMqtt();
 
-    WiFiClient _plainClient;
     WiFiClientSecure _tlsClient;
     PubSubClient _mqtt;
 
+    mutable SemaphoreHandle_t _netMutex = nullptr;
+    QueueHandle_t _inQueue = nullptr;
+
     String _ssid;
     String _password;
+    volatile bool _wifiCredsDirty = false;
 
     uint32_t _lastWifiAttempt = 0;
     uint32_t _lastMqttAttempt = 0;
     uint32_t _mqttBackoffMs = Cfg::MQTT_RETRY_MS;
-    uint8_t _cachedUserCount = 0;
+    volatile bool _userSyncPending = false;
 
     static NetworkService* _self;
-    void (*_commandHandler)(const String&) = nullptr;
-    void (*_userSyncHandler)(const String&) = nullptr;
 };
 
 // ============================================================
-// LOCKER MANAGER
+// LOCKER MANAGER (DOMAIN STATE MACHINE)
 // ============================================================
 
 class LockerManager {
@@ -266,40 +370,55 @@ public:
                ClockService& clock, NetworkService& network);
     void tick();
 
-    // User-facing assign & single-use unlock/release
+    // User-facing assign & unlock (Finish vs Extend)
     ActionStatus assignByUid(const String& uid, String& lockerName);
-    ActionStatus assignByPin(const String& pin, String& lockerName);
-    ActionStatus unlockAndReleaseByUid(const String& uid, String& lockerName);
-    ActionStatus unlockAndReleaseByPin(const String& pin, String& lockerName);
+    ActionStatus assignByUserSlot(int userSlot, const char* method, String& lockerName);
 
-    // D-mode self-service RFID registration via App OTP
+    ActionStatus verifyUnlockByUid(uint8_t lockerIdx, const String& uid, String& outUserId);
+    bool verifyUnlockByUserSlot(uint8_t lockerIdx, int userSlot, String& outUserId);
+    ActionStatus executeUnlockFinish(uint8_t lockerIdx, const char* method, String& lockerName);
+    ActionStatus executeUnlockExtend(uint8_t lockerIdx, const char* method, String& lockerName);
+
+    // D-Menu RFID OTP & Admin RFID Registration
     bool registerPendingOtp(const String& userId, const String& otp);
     bool verifyOtp(const String& otp, String& outUserId);
-    ActionStatus completeOtpRfidRegistration(const String& otp, const String& uid,
-                                             String& outUserId);
+    ActionStatus completeOtpRfidRegistration(const String& otp, const String& uid, String& outUserId);
+    ActionStatus adminSetUserRfid(const String& userId, const String& uid);
 
-    // Remote / Admin / Serial operations
+    // Admin / Remote / Serial controls
+    bool adminAssignUnregistered(uint8_t index, const String& label);
     bool remoteSetLock(uint8_t index, bool locked, const char* source = "BACKEND");
     bool release(uint8_t index, const char* source = "BACKEND");
+    void overwriteClearExpired(int indexOrAll, const char* source = "ADMIN");
     void broadcastAllStates(const char* method = "SYNC");
 
-    // Two-way user database sync
+    // Admin hardware provisioning (D-menu first-boot & 2FA)
+    bool isAdminProvisioned() const;
+    bool provisionAdmin(const String& pin, const String& rfidUid);
+    bool verifyAdminRfid(const String& rfidUid) const;
+    void resetAdminProvisioning();
+
+    // Synced User Database
     bool upsertUser(const String& userId, const String& uid,
                     const String& salt, const String& pinHash);
     bool deleteUser(const String& userId);
     void clearUsers();
+    bool assignFromBackend(const String& lockerId, const String& userId, bool open);
+    bool unassignFromBackend(const String& lockerId, const String& userId);
+    void clearAssignments();
     uint8_t registeredUserCount() const;
     void listUsersToSerial(Stream& out) const;
+
+    // Async Core 0 PBKDF2 Auth Worker Support
+    void processAuthRequestOnCore0(const AuthRequest& req, AuthResult& res);
 
     // Queries
     int findLockerId(const String& id) const;
     uint8_t availableCount() const;
     uint8_t problematicCount() const;
-
     bool isLocked(uint8_t index) const {
         return index < Cfg::LOCKER_COUNT ? _locked[index] : true;
     }
-
     const LockerRecord& record(uint8_t index) const {
         return _records[index];
     }
@@ -313,13 +432,8 @@ private:
     };
 
     int findRegisteredUserByUid(const String& uid) const;
-    int findRegisteredUserByPin(const String& pin) const;
+    int findRegisteredUserByUserId(const String& userId) const;
     int findAssignedLockerByUserId(const String& userId) const;
-    int findAssignedLockerByUid(const String& uid) const;
-    int findAssignedLockerByPin(const String& pin) const;
-
-    ActionStatus assignToUser(int userIdx, const char* method, String& lockerName);
-    ActionStatus releaseUnlockedLocker(int lockerIdx, const char* method, String& lockerName);
 
     void saveLocker(uint8_t index);
     void emitEvent(const char* name, uint8_t index, const char* method, const char* userId = "");
@@ -332,8 +446,10 @@ private:
     ClockService* _clock = nullptr;
     NetworkService* _network = nullptr;
 
+    mutable SemaphoreHandle_t _stateMutex = nullptr;
     LockerRecord _records[Cfg::LOCKER_COUNT];
     UserRecord _users[Cfg::MAX_USERS];
+    AdminConfig _adminCfg;
     PendingOtp _otps[Cfg::MAX_PENDING_OTPS];
 
     bool _locked[Cfg::LOCKER_COUNT] = {true, true, true, true};
@@ -345,7 +461,7 @@ private:
 };
 
 // ============================================================
-// USER INTERFACE
+// USER INTERFACE STATE MACHINE (CORE 1)
 // ============================================================
 
 class UserInterface {
@@ -354,27 +470,48 @@ public:
                ClockService& clock, NetworkService& net);
     void tick();
 
+    void onAsyncAuthResult(const AuthResult& res);
     void notifyRemoteCommand(const String& title, const String& detail, bool isError);
+    bool isAdminActive() const;
+    bool isSessionBusy() const;
 
 private:
     enum State : uint8_t {
-        HOME,
-        ASSIGN_ASK,
-        QR_CODE,
+        HOME = 0,
+        QR_REGISTER,
         ASSIGN_CRED,
+        UNLOCK_SELECT,
         UNLOCK_CRED,
-        OTP_ENTRY,
-        OTP_TAP_RFID,
-        RESULT,
-        ADMIN_MENU
+        UNLOCK_ACTION,
+        D_MENU_PIN,
+        RFID_OTP_TAP,
+        ADMIN_SETUP_PIN,
+        ADMIN_SETUP_RFID,
+        ADMIN_AUTH_RFID,
+        ADMIN_MENU,
+        ADMIN_PICK_LOCKER,
+        ADMIN_SET_RFID_UID,
+        ADMIN_SET_RFID_TAP,
+        RESULT
+    };
+
+    enum AdminOp : uint8_t {
+        OP_NONE = 0,
+        OP_ASSIGN_UNREG,
+        OP_TOGGLE_LOCK,
+        OP_RELEASE
     };
 
     void onKey(char key);
     void onRfidScanned(const String& uid);
+    void submitAsyncPin(AuthRequestType type, int8_t lockerIdx, const String& pin);
     void showResult(const String& title, const String& detail, bool isError);
+    void showQrPrompt(const char* subtitle);
+    void enterState(State next, uint32_t timeoutMs);
     void returnHome();
     void touchActivity();
-    void refreshCurrentScreen();
+    uint16_t remainingSeconds() const;
+    void refreshCurrentScreen(bool fullRedraw);
 
     Hardware* _hw = nullptr;
     LockerManager* _lockers = nullptr;
@@ -382,19 +519,25 @@ private:
     NetworkService* _net = nullptr;
 
     State _state = HOME;
-    String _pin;
+    AdminOp _adminOp = OP_NONE;
+
+    String _inputBuf;
     String _activeOtp;
-    String _otpUserId;
+    String _pendingUserId;
+    String _setupAdminPin;
+    uint8_t _selectedLocker = 0;
+    uint32_t _pendingReqId = 0;
+    bool _verifyingAsync = false;
 
     bool _hasPendingNotice = false;
     String _pendingTitle;
     String _pendingDetail;
     bool _pendingError = false;
 
-    uint32_t _lastActivityMs = 0;
+    uint32_t _stateEnteredMs = 0;
+    uint32_t _stateTimeoutMs = 0;
     uint32_t _lastKeyScan = 0;
     uint32_t _lastUiRefresh = 0;
-    uint32_t _resultDeadline = 0;
 
     char _rawKey = 0;
     char _stableKey = 0;
@@ -402,7 +545,7 @@ private:
 };
 
 // ============================================================
-// GLOBALS & HELPERS
+// GLOBALS & FREERTOS QUEUES
 // ============================================================
 
 extern Storage gStorage;
@@ -412,7 +555,7 @@ extern NetworkService gNetwork;
 extern LockerManager gLockers;
 extern UserInterface gUi;
 
-String makePinHash(const char* salt, const String& pin);
-bool verifySignedPacket(const String& packet, uint8_t expectedFields,
-                        String* outFields, String& errorReason);
+extern QueueHandle_t gAuthReqQueue;
+extern QueueHandle_t gAuthResQueue;
+
 void appLog(const char* level, const char* fmt, ...);

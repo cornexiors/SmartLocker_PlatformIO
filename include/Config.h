@@ -11,22 +11,15 @@
 namespace Cfg {
 
 // ============================================================
-// SITE, CONTROLLER & SCALABILITY IDENTITY
+// MULTI-LOCATION & CONTROLLER IDENTITY
 // ============================================================
 
 constexpr char LOCATION_ID[] = "LOC_CAMPUS_A";
-constexpr char DEVICE_ID[]   = "LOCKER_CTRL_01";
-constexpr uint8_t LOCKER_COUNT = 4;
-
-constexpr char LOCKER_IDS[LOCKER_COUNT][12] = {
-    "LOCKER_001",
-    "LOCKER_002",
-    "LOCKER_003",
-    "LOCKER_004"
-};
+constexpr char DEVICE_ID[] = "LOCKER_CTRL_01";
+constexpr char FIRMWARE_VERSION[] = "2.1.0";
 
 // ============================================================
-// NETWORK & TLS MQTT (PORT 8883)
+// NETWORK & TLS MQTT
 // ============================================================
 
 constexpr bool MQTT_USE_TLS = true;
@@ -36,7 +29,7 @@ constexpr char MQTT_BASE[] = "smartlocker/demo/";
 constexpr char MQTT_USERNAME[] = CfgSecrets::MQTT_USERNAME;
 constexpr char MQTT_PASSWORD[] = CfgSecrets::MQTT_PASSWORD;
 
-// ISRG Root X1 PEM CA for HiveMQ Cloud / Let's Encrypt TLS validation
+// ISRG Root X1 PEM Root CA for strict TLS certificate verification
 constexpr char MQTT_ROOT_CA[] = R"EOF(-----BEGIN CERTIFICATE-----
 MIIFazCCA1OgAwIBAgIRAIIQz7DSQONZRGPgu2OCiwAwDQYJKoZIhvcNAQELBQAw
 TzELMAkGA1UEBhMCVVMxKTAnBgNVBAoTIEludGVybmV0IFNlY3VyaXR5IFJlc2Vh
@@ -74,75 +67,87 @@ constexpr char WIFI_PASSWORD[] = CfgSecrets::WIFI_PASSWORD;
 constexpr char HMAC_SECRET[] = CfgSecrets::HMAC_SECRET;
 
 // ============================================================
-// SERVO ACTUATORS (4 ADJACENT PINS, 165/15 DEG SAFE STOPS)
+// LOCKERS AND 180-DEGREE POSITIONAL SERVOS (4 ADJACENT PINS)
 // ============================================================
 
+constexpr uint8_t LOCKER_COUNT = 4;
+
+constexpr char LOCKER_IDS[LOCKER_COUNT][12] = {
+    "LOCKER_001",
+    "LOCKER_002",
+    "LOCKER_003",
+    "LOCKER_004"
+};
+
+// Relocated to 4 adjacent GPIOs on ESP32-S3-DevKitC-1
 constexpr uint8_t SERVO_PINS[LOCKER_COUNT] = {
     15, 16, 17, 18
 };
 
+// Proven mechanical stops
 constexpr int SERVO_LOCK_ANGLE = 165;
 constexpr int SERVO_UNLOCK_ANGLE = 15;
+
 constexpr uint16_t SERVO_MIN_US = 1000;
 constexpr uint16_t SERVO_MAX_US = 2000;
 
 // ============================================================
-// PCF8575 I/O EXPANDER (P00-P07 KEYPAD, P8-P11 REED SENSORS)
+// PCF8575 I/O EXPANDER (KEYPAD P00-P07 + REEDS P10-P13)
 // ============================================================
 
 constexpr uint8_t PCF8575_ADDRESS_FIRST = 0x20;
-constexpr uint8_t PCF8575_ADDRESS_LAST  = 0x27;
-constexpr uint8_t PCF8575_ADDRESS       = 0x20;
-constexpr uint8_t PCF_UNUSED_PIN        = 0xFF;
-constexpr uint8_t NO_PIN                = PCF_UNUSED_PIN;
+constexpr uint8_t PCF8575_ADDRESS_LAST = 0x27;
+constexpr uint8_t PCF8575_ADDRESS = 0x20;
 
-// PCF8575 bits 8..11 correspond to silkscreen P10..P13
-constexpr uint8_t PCF_REED_BITS[LOCKER_COUNT] = {
+// Bits 8..11 correspond to P10..P13 on PCF8575
+constexpr uint8_t REED_PCF_BITS[LOCKER_COUNT] = {
     8, 9, 10, 11
 };
 
-constexpr bool REED_CLOSED_LEVEL = false; // Active-LOW to GND
+constexpr bool REED_CLOSED_IS_LOW = true;
 constexpr uint16_t REED_DEBOUNCE_MS = 45;
 constexpr uint32_t DOOR_OPEN_ALERT_MS = 60000;
 constexpr uint32_t DOOR_ALERT_REPEAT_MS = 10000;
 
 // ============================================================
-// I2C, SPI, DUAL LEDS & BUZZER PINS
+// I2C & SPI PINS (NO EXTERNAL RTC IN v2.1)
 // ============================================================
 
 constexpr uint8_t I2C_SDA = 1;
 constexpr uint8_t I2C_SCL = 2;
 
-constexpr uint8_t SPI_SCK  = 12;
+constexpr uint8_t SPI_SCK = 12;
 constexpr uint8_t SPI_MISO = 13;
 constexpr uint8_t SPI_MOSI = 11;
 
-constexpr uint8_t RFID_CS  = 7;
+constexpr uint8_t RFID_CS = 7;
 constexpr uint8_t RFID_RST = 6;
 
-constexpr uint8_t TFT_CS   = 10;
-constexpr uint8_t TFT_DC   = 9;
-constexpr uint8_t TFT_RST  = 8;
+constexpr uint8_t TFT_CS = 10;
+constexpr uint8_t TFT_DC = 9;
+constexpr uint8_t TFT_RST = 8;
 
-// 2 = Portrait rotated 180 degrees
 constexpr uint8_t TFT_ROTATION = 2;
-constexpr uint8_t TFT_INIT_TAB = 0;
 constexpr uint16_t TFT_WIDTH = 128;
 constexpr uint16_t TFT_VISIBLE_HEIGHT = 140;
 
 constexpr uint8_t SD_CS = 5;
 constexpr uint32_t SD_SPI_HZ = 4000000;
 
-constexpr uint8_t LED_PIN = 14;      // Discrete online status LED
-constexpr uint8_t RGB_LED_PIN = 48;  // ESP32-S3 onboard WS2812 RGB LED
-constexpr uint8_t RGB_BRIGHTNESS = 28;
+// ============================================================
+// DUAL STATUS LEDS & BUZZER
+// ============================================================
+
+constexpr uint8_t LED_PIN = 14;         // External discrete LED (Online status)
+constexpr uint8_t RGB_LED_PIN = 48;     // ESP32-S3 onboard WS2812 RGB LED
+constexpr uint8_t RGB_BRIGHTNESS = 28;  // Gentle eye-safe brightness (0-255)
 
 constexpr uint8_t BUZZER_PIN = 38;
 constexpr bool BUZZER_ENABLED = true;
 constexpr uint16_t BUZZER_TONE_HZ = 2000;
 
 // ============================================================
-// KEYPAD & TIMING
+// KEYPAD, FREERTOS & UI TIMING
 // ============================================================
 
 constexpr char KEYMAP[4][4] = {
@@ -155,16 +160,21 @@ constexpr char KEYMAP[4][4] = {
 constexpr uint32_t WIFI_RETRY_MS = 10000;
 constexpr uint32_t MQTT_RETRY_MS = 5000;
 
+constexpr uint32_t CORE1_LOOP_TICK_MS = 10;
 constexpr uint32_t KEYPAD_SCAN_MS = 25;
 constexpr uint32_t RFID_SCAN_MS = 100;
 constexpr uint32_t UI_REFRESH_MS = 1000;
 constexpr uint32_t UI_RESULT_MS = 3000;
-constexpr uint32_t UI_IDLE_TIMEOUT_MS = 18000;
+constexpr uint32_t UI_QR_TIMEOUT_MS = 15000;
+constexpr uint32_t UI_IDLE_TIMEOUT_MS = 20000;
 constexpr uint32_t ADMIN_MENU_TIMEOUT_MS = 120000;
 constexpr uint32_t SERIAL_ADMIN_TIMEOUT_MS = 600000;
 
+constexpr uint32_t CORE0_TASK_STACK = 12288;
+constexpr UBaseType_t CORE0_TASK_PRIORITY = 2;
+
 // ============================================================
-// RENTAL, CREDENTIALS, ADMIN & QUEUE LIMITS
+// RENTAL, CREDENTIALS, OTP & STORAGE
 // ============================================================
 
 constexpr uint32_t RENTAL_SECONDS = 24UL * 60UL * 60UL;
@@ -175,30 +185,23 @@ constexpr uint16_t PIN_PBKDF2_ITERATIONS = 10000;
 
 constexpr uint8_t MAX_USERS = 32;
 constexpr uint8_t MAX_PENDING_OTPS = 16;
-constexpr uint32_t OTP_TTL_MS = 5UL * 60UL * 1000UL; // 5 minutes
+constexpr uint32_t OTP_TTL_MS = 5UL * 60UL * 1000UL;
 
-constexpr char SERIAL_ADMIN_USER[] = "pdt04'26";
-constexpr char SERIAL_ADMIN_INIT_PASS[] = "ft.OverEngineered07";
-constexpr char APP_REGISTER_URL[] = "app.smartlocker.id";
+constexpr char APP_REGISTER_URL[] = "https://app.smartlocker.id";
 
 constexpr uint8_t SYNC_QUEUE_CAPACITY = 32;
 constexpr uint8_t DEBUG_LOG_CAPACITY = 24;
-constexpr size_t LOG_MAX_BYTES = 32768;
 
 // ============================================================
-// TIME, SECURITY & FREERTOS IPC
+// TIME & PACKET SECURITY
 // ============================================================
 
 constexpr uint32_t MIN_VALID_EPOCH = 1700000000UL;
-constexpr int8_t LOCAL_UTC_OFFSET_HOURS = 7;
+constexpr int8_t LOCAL_UTC_OFFSET_HOURS = 7; // WIB (UTC+7)
 constexpr uint32_t NTP_RESYNC_MS = 2UL * 60UL * 60UL * 1000UL;
 
 constexpr uint32_t COMMAND_WINDOW_SECONDS = 300;
-constexpr bool ENABLE_COMMAND_TIMESTAMP_CHECK = false;
+constexpr bool ENABLE_COMMAND_TIMESTAMP_CHECK = true;
 constexpr uint16_t MQTT_BUFFER_SIZE = 768;
-
-constexpr uint8_t AUTH_QUEUE_LEN = 4;
-constexpr uint8_t MQTT_IN_QUEUE_LEN = 12;
-constexpr uint8_t MQTT_OUT_QUEUE_LEN = 16;
 
 } // namespace Cfg
